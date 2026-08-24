@@ -1,5 +1,24 @@
 # Infinity WhatsApp Services
 
+This is a monorepo — each package has its own `package.json`. To install
+everything from the repo root, run:
+
+```bash
+npm run setup          # installs all packages and builds the WhatsApp client
+```
+
+Or install a single package:
+
+```bash
+npm run install:client         # only whatsapp-client/
+npm run install:endpoints      # only endpoints-integrator/
+npm run install:media          # only media/
+npm run install:bridge         # only paperclip-bridge/
+```
+
+`npm install` at the repo root now works (it delegates via `--prefix`).
+If you prefer the manual path: `cd whatsapp-client && npm install && npm run build`.
+
 A WhatsApp client that delegates prompts to external AI endpoints
 (Qwen Code, Perplexity *sonar-reasoning-pro* and *sonar-deep-research*,
 Firecrawl) and ships with built-in support for media attachments, voice

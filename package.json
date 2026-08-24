@@ -1,0 +1,20 @@
+{
+  "name": "infinity-whatsapp-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Root convenience layer for the Infinity WhatsApp monorepo. Each package has its own package.json; running npm install at the repo root delegates to them.",
+  "scripts": {
+    "setup": "npm --prefix whatsapp-client install && npm --prefix whatsapp-client run build && npm --prefix endpoints-integrator install && npm --prefix media install && npm --prefix paperclip-bridge install",
+    "install:client": "npm --prefix whatsapp-client install",
+    "install:endpoints": "npm --prefix endpoints-integrator install",
+    "install:media": "npm --prefix media install",
+    "install:bridge": "npm --prefix paperclip-bridge install",
+    "build:client": "npm --prefix whatsapp-client run build",
+    "build:endpoints": "npm --prefix endpoints-integrator run build",
+    "build:media": "npm --prefix media run build",
+    "build:bridge": "npm --prefix paperclip-bridge run build",
+    "build": "npm run build:client && npm run build:endpoints && npm run build:media && npm run build:bridge",
+    "start": "npm --prefix whatsapp-client start",
+    "smoke": "bash whatsapp-client/scripts/smoke-unit.sh && bash whatsapp-client/scripts/smoke-config.sh && bash whatsapp-client/scripts/smoke-integration.sh"
+  }
+}
