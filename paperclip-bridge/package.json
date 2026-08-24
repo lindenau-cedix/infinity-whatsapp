@@ -1,0 +1,15 @@
+{
+  "name": "infinity-paperclip-bridge",
+  "version": "0.1.0",
+  "description": "Paperclip ↔ WhatsApp bridge for Infinity — outbound event mirror and inbound slash-command router.",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

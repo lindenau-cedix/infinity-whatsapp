@@ -1,0 +1,19 @@
+{
+  "name": "infinity-endpoints-integrator",
+  "version": "0.1.0",
+  "description": "Endpoint dispatchers for the Infinity WhatsApp client (Qwen CLI, Perplexity chat completions, Firecrawl).",
+  "private": true,
+  "type": "commonjs",
+  "main": "dispatcher/index.js",
+  "scripts": {
+    "test": "node --test test/qwen.test.js test/perplexity.test.js test/firecrawl.test.js test/dispatch.test.js",
+    "test:qwen": "node --test test/qwen.test.js",
+    "test:perplexity": "node --test test/perplexity.test.js",
+    "test:firecrawl": "node --test test/firecrawl.test.js",
+    "test:dispatch": "node --test test/dispatch.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

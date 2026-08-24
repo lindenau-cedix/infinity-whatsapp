@@ -1,0 +1,53 @@
+{
+  "kind": "ask_user_questions",
+  "prompt": "Before I propose a plan, I want to settle on the right starting point. A few quick choices:",
+  "payload": {
+    "version": 1,
+    "questions": [
+      {
+        "id": "starting-scope",
+        "header": "Starting scope",
+        "prompt": "What is the single first concrete goal you want to tackle?",
+        "selectionMode": "single",
+        "options": [
+          {"id": "mvp-bridge", "label": "Build the WhatsApp to endpoints bridge (MVP)", "description": "Stand up a working WhatsApp client that forwards prompts to Qwen Code, Perplexity RP/DR, and Firecrawl across 4 groups, with image/video saving and Whisper transcription. Voice answer (ElevenLabs), Paperclip integration, and Grill-me come later."},
+          {"id": "blueprint", "label": "Produce a detailed build blueprint first", "description": "Write the full architecture, group routing logic, message-handling pipeline, media pipeline, and feature specs as a design doc — no code yet — so we know exactly what we will build before we build it."},
+          {"id": "prototype", "label": "Quick throwaway prototype of the dispatcher", "description": "A small, scrappy dispatcher that pretends to be the four endpoints, proving the WhatsApp-to-model routing shape before we commit to real provider integrations."}
+        ]
+      },
+      {
+        "id": "auth-keys",
+        "header": "API access",
+        "prompt": "How ready are the third-party API credentials (Qwen, Perplexity, Firecrawl, OpenAI Whisper, ElevenLabs, WhatsApp Business API)?",
+        "selectionMode": "single",
+        "options": [
+          {"id": "have-all", "label": "I have them all ready to plug in", "description": "We can integrate against the live endpoints right away."},
+          {"id": "some-mock", "label": "I have some, mock the rest", "description": "Use real keys where available, stub the others so development is not blocked."},
+          {"id": "all-mock", "label": "I do not have any yet", "description": "Build everything against mocks/stubs; I will wire real keys later."}
+        ]
+      },
+      {
+        "id": "language",
+        "header": "Stack and language",
+        "prompt": "What is the stack/language preference for the WhatsApp client itself?",
+        "selectionMode": "single",
+        "options": [
+          {"id": "node-ts", "label": "Node.js + TypeScript", "description": "Mature whatsapp-web.js ecosystem, fast to iterate."},
+          {"id": "python", "label": "Python", "description": "Strong async + AI SDK ergonomics."},
+          {"id": "no-pref", "label": "You pick the best fit", "description": "I propose the stack as part of the plan based on ecosystem fit."}
+        ]
+      },
+      {
+        "id": "done",
+        "header": "Done =",
+        "prompt": "What does done look like for the first deliverable so I know when to stop?",
+        "selectionMode": "single",
+        "options": [
+          {"id": "smoke-test", "label": "I can send a text prompt in each of the 4 groups and get a real model reply back", "description": "Happiest-path only; media + voice + special features are not in scope yet."},
+          {"id": "all-features", "label": "Every feature in the mission works end-to-end (media, voice, Grill-me, Paperclip, ElevenLabs)", "description": "Full feature parity from day one."},
+          {"id": "demoable", "label": "A demoable run I can show to a stakeholder", "description": "Stable enough to show off, even if a few features are stubbed."}
+        ]
+      }
+    ]
+  }
+}

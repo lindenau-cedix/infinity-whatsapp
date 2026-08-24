@@ -1,0 +1,173 @@
+// =============================================================================
+// Credential vault loader.
+//
+// Reads .env once at boot, validates required keys, and exposes a typed
+// Credentials object. Adapters receive ctx.credentials — they never read
+// process.env directly. On a missing key, raise AuthError with the key name
+// and which adapter demanded it; never silently retry.
+// =============================================================================
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+// --- public types -----------------------------------------------------------
+
+export type KeyName =
+  | "QWEN_API_KEY"
+  | "PERPLEXITY_REASONING_API_KEY"
+  | "PERPLEXITY_DEEP_RESEARCH_API_KEY"
+  | "FIRECRAWL_API_KEY"
+  | "OPENAI_WHISPER_API_KEY"
+  | "ELEVENLABS_API_KEY"
+  | "ELEVENLABS_VOICE_ID";
+
+export interface Credentials {
+  qwen: { apiKey: string; baseUrl: string };
+  perplexityReasoning: { apiKey: string; model: string };
+  perplexityDeepResearch: { apiKey: string; model: string };
+  firecrawl: { apiKey: string; baseUrl: string };
+  // Voice & Media Engineer reads these directly; we only presence-check.
+  media: { openaiWhisperApiKey: string; elevenLabsApiKey: string; elevenLabsVoiceId: string };
+  mediaDir: string;
+}
+
+// --- errors -----------------------------------------------------------------
+
+export class AuthError extends Error {
+  constructor(
+    public readonly key: KeyName,
+    public readonly adapter: string,
+    hint: string,
+  ) {
+    super(
+      `AuthError: missing credential "${key}"\n` +
+        `  → required by adapter "${adapter}"\n` +
+        `  → ${hint}`,
+    );
+    this.name = "AuthError";
+  }
+}
+
+// --- loader -----------------------------------------------------------------
+
+const DEFAULTS: Record<string, string> = {
+  QWEN_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  PERPLEXITY_REASONING_MODEL: "sonar-reasoning-pro",
+  PERPLEXITY_DEEP_RESEARCH_MODEL: "sonar-deep-research",
+  FIRECRAWL_BASE_URL: "https://api.firecrawl.dev",
+  ELEVENLABS_VOICE_ID: "",
+  INFINITY_MEDIA_DIR: "./media",
+};
+
+function parseDotenv(contents: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of contents.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const k = line.slice(0, eq).trim();
+    let v = line.slice(eq + 1).trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+      v = v.slice(1, -1);
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+function readDotenv(envPath: string): Record<string, string> {
+  if (!fs.existsSync(envPath)) return {};
+  return parseDotenv(fs.readFileSync(envPath, "utf8"));
+}
+
+function readKey(file: Record<string, string>, name: KeyName): string | undefined {
+  const fromFile = file[name];
+  if (fromFile && fromFile.length > 0) return fromFile;
+  const fromProc = process.env[name];
+  if (fromProc && fromProc.length > 0) return fromProc;
+  return undefined;
+}
+
+function requireKey(
+  file: Record<string, string>,
+  name: KeyName,
+  adapter: string,
+  hint: string,
+): string {
+  const v = readKey(file, name);
+  if (!v) throw new AuthError(name, adapter, hint);
+  return v;
+}
+
+function lookup<T extends string>(
+  file: Record<string, string>,
+  name: string,
+): T {
+  const v = file[name] ?? process.env[name];
+  return (v && v.length > 0 ? v : DEFAULTS[name]) as T;
+}
+
+/**
+ * Load and validate the credential vault.
+ *
+ * @param envPath absolute path to .env (defaults to <cwd>/.env)
+ * @param which subset of adapters being loaded — controls which keys we
+ *              validate strictly. Pass `["qwenCode", "firecrawl"]` etc.
+ */
+export function loadCredentials(
+  envPath: string = path.resolve(process.cwd(), ".env"),
+  which: AdapterKey[] = ["qwenCode", "perplexityReasoning", "perplexityDeepResearch", "firecrawl", "voiceMedia"],
+): Credentials {
+  const file = readDotenv(envPath);
+
+  // Endpoints Integrator keys
+  const qwenKey = which.includes("qwenCode")
+    ? requireKey(file, "QWEN_API_KEY", "qwenCode",
+        "issue a key at https://dashscope.aliyuncs.com/apiKey and add it to .env")
+    : (readKey(file, "QWEN_API_KEY") ?? "");
+  const rpKey = which.includes("perplexityReasoning")
+    ? requireKey(file, "PERPLEXITY_REASONING_API_KEY", "perplexityReasoning",
+        "issue a key at https://www.perplexity.ai/settings/api")
+    : (readKey(file, "PERPLEXITY_REASONING_API_KEY") ?? "");
+  const drKey = which.includes("perplexityDeepResearch")
+    ? requireKey(file, "PERPLEXITY_DEEP_RESEARCH_API_KEY", "perplexityDeepResearch",
+        "issue a key at https://www.perplexity.ai/settings/api")
+    : (readKey(file, "PERPLEXITY_DEEP_RESEARCH_API_KEY") ?? "");
+  const fcKey = which.includes("firecrawl")
+    ? requireKey(file, "FIRECRAWL_API_KEY", "firecrawl",
+        "issue a key at https://firecrawl.dev")
+    : (readKey(file, "FIRECRAWL_API_KEY") ?? "");
+
+  // Voice & Media Engineer keys — presence-checked only
+  let whisper = "";
+  let eleven = "";
+  let elevenVoice = "";
+  if (which.includes("voiceMedia")) {
+    whisper = requireKey(file, "OPENAI_WHISPER_API_KEY", "voiceMedia",
+      "Voice & Media Engineer needs this — issue at https://platform.openai.com/api-keys");
+    eleven = requireKey(file, "ELEVENLABS_API_KEY", "voiceMedia",
+      "Voice & Media Engineer needs this — issue at https://elevenlabs.io");
+    elevenVoice = lookup<string>(file, "ELEVENLABS_VOICE_ID");
+  }
+
+  return {
+    qwen: { apiKey: qwenKey, baseUrl: lookup<string>(file, "QWEN_BASE_URL") },
+    perplexityReasoning: { apiKey: rpKey, model: lookup<string>(file, "PERPLEXITY_REASONING_MODEL") },
+    perplexityDeepResearch: { apiKey: drKey, model: lookup<string>(file, "PERPLEXITY_DEEP_RESEARCH_MODEL") },
+    firecrawl: { apiKey: fcKey, baseUrl: lookup<string>(file, "FIRECRAWL_BASE_URL") },
+    media: {
+      openaiWhisperApiKey: whisper,
+      elevenLabsApiKey: eleven,
+      elevenLabsVoiceId: elevenVoice,
+    },
+    mediaDir: lookup<string>(file, "INFINITY_MEDIA_DIR"),
+  };
+}
+
+export type AdapterKey =
+  | "qwenCode"
+  | "perplexityReasoning"
+  | "perplexityDeepResearch"
+  | "firecrawl"
+  | "voiceMedia";
