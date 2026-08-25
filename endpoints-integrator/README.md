@@ -20,10 +20,15 @@ infinity/
     types.ts              # EndpointAdapter, PromptContext, Reply
     index.ts              # public barrel + getAdapter()
     adapters/
-      qwenCode.ts
       perplexityReasoning.ts
       perplexityDeepResearch.ts
       firecrawl.ts
+  dispatcher/             # runtime JS dispatcher (used by register.js)
+    qwen.js               # local Qwen CLI adapter (`qwen -m qwen3:30b-a3b -p "..."`)
+    perplexity.js
+    firecrawl.js
+    shared.js
+    index.js
 ```
 
 ## Quick start
@@ -32,7 +37,14 @@ infinity/
 cp .env.example .env
 # fill in real keys
 chmod +x scripts/*.sh
-QWEN_API_KEY=... ./scripts/smoke-qwen.sh
+
+# Qwen runs locally on the VPS — no API key. Just install the CLI:
+#   https://github.com/QwenLM/Qwen3-Coder
+./scripts/smoke-qwen.sh
+
+# Perplexity / Firecrawl still need their cloud keys:
+PERPLEXITY_API_KEY=... ./scripts/smoke-perplexity-rp.sh
+FIRECRAWL_API_KEY=... ./scripts/smoke-firecrawl.sh
 ```
 
 ## Adapter contract

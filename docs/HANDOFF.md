@@ -39,15 +39,14 @@ Workspace root:
 | --- | --- |
 | `.env.example` | Credential vault template — every required key (Qwen, Perplexity RP/DR, Firecrawl, OpenAI Whisper, ElevenLabs) with inline comments pointing at the issuer console. |
 | `docs/credential-vault.md` | Single source of truth: key ownership map, rotation cadence, boot-time validation contract. |
-| `src/credentials.ts` | Typed `loadCredentials()` loader + `AuthError` (adapter, key name, remediation hint). |
+| `src/credentials.ts` | Typed `loadCredentials()` loader + `AuthError` (adapter, key name, remediation hint). Qwen is local-CLI only as of INFA-17 — no `QWEN_API_KEY`. |
 | `src/types.ts` | Frozen `EndpointAdapter` interface: `run(prompt, ctx) → Reply`. `MediaRef[]` (path-based), never base64. |
-| `src/adapters/qwenCode.ts` | Qwen CLI dispatcher (`qwen -m qwen3:30b-a3b -p "..."`). |
 | `src/adapters/perplexityReasoning.ts` | Perplexity `sonar-reasoning-pro`. |
 | `src/adapters/perplexityDeepResearch.ts` | Perplexity `sonar-deep-research`. |
 | `src/adapters/firecrawl.ts` | Firecrawl `/v1/scrape`. |
-| `src/index.ts` | Public surface: exports the adapters and the credential loader. |
+| `src/index.ts` | Public surface: exports the typed adapters and the credential loader. Qwen is intentionally NOT a typed class — it is the local CLI dispatcher, wrapped by `register.js`. |
 | `dispatcher/index.js` | Runtime JS dispatcher (one file per endpoint + `shared.js`). |
-| `dispatcher/qwen.js`, `dispatcher/perplexity.js`, `dispatcher/firecrawl.js`, `dispatcher/shared.js` | Runtime adapter implementations. |
+| `dispatcher/qwen.js`, `dispatcher/perplexity.js`, `dispatcher/firecrawl.js`, `dispatcher/shared.js` | Runtime adapter implementations. `qwen.js` runs `qwen -m qwen3:30b-a3b -p "[PROMPT]"` locally. |
 | `register.js` | Adapter factory the WhatsApp client calls via `globalThis.INFINITY_INTEGRATOR_ADAPTERS(name)` (closes INFA-12). |
 | `scripts/smoke-qwen.sh`, `smoke-perplexity-rp.sh`, `smoke-perplexity-dr.sh`, `smoke-firecrawl.sh` | Per-provider smoke tests; validated against live APIs with placeholder keys (rejection paths confirmed). |
 | `test/{dispatch,firecrawl,perplexity,qwen,register}.test.js` + `test/helpers.js` | Mocha test suites for every adapter. |

@@ -14,8 +14,20 @@ import { Logger } from "./logger.js";
 import { MediaStore } from "./media.js";
 import { WWebJsAdapter } from "./wwebjsAdapter.js";
 
+// Wire the Endpoints Integrator adapter factory into globalThis. Requiring
+// `endpoints-integrator/register.js` is a side-effect that installs the real
+// factory so the dispatcher never falls back to the `[stub:…]` placeholder.
+// If the package can't be resolved we want a loud failure at boot, not a
+// silent stub loop — every group would echo back `[stub:…]` text instead of
+// real answers, which is exactly what INFA-18 set out to fix.
+// `register.js` is plain CommonJS without a `.d.ts`; the type information
+// lives on `globalThis.INFINITY_INTEGRATOR_ADAPTERS`, which `dispatcher.ts`
+// already exports as `AdapterFactory`.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+require("../../endpoints-integrator/register.js");
+
 declare global {
-  // Set by the Integrator / Tech Lead at deploy time:
+  // Set by the Endpoints Integrator's `register.js` at boot:
   //   globalThis.INFINITY_INTEGRATOR_ADAPTERS = (name) => new …Adapter();
   // eslint-disable-next-line no-var
   var INFINITY_INTEGRATOR_ADAPTERS: AdapterFactory | undefined;
@@ -24,6 +36,18 @@ declare global {
 async function main(): Promise<void> {
   const { groups, runtime } = loadConfig();
   const log = new Logger("main", runtime.logLevel);
+
+  // Fail loudly if the Integrator factory never installed itself. Without
+  // this guard, the dispatcher silently falls back to the stub factory and
+  // groups receive `[stub:qwenCode] …` text instead of real answers.
+  if (!globalThis.INFINITY_INTEGRATOR_ADAPTERS) {
+    throw new Error(
+      "End-to-end wiring is incomplete: globalThis.INFINITY_INTEGRATOR_ADAPTERS " +
+        "is unset after requiring 'endpoints-integrator/register.js'. " +
+        "Check that the Endpoints Integrator workspace is present and its " +
+        "register.js exports the factory.",
+    );
+  }
 
   const media = new MediaStore(runtime.mediaDir, log);
   await media.init();
@@ -50,23 +74,7 @@ async function main(): Promise<void> {
     }
   });
 
-  const factory: AdapterFactory =
-    globalThis.INFINITY_INTEGRATOR_ADAPTERS ??
-    ((name) => {
-      // No Integrator module registered — return a stub that logs the request
-      // and surfaces the dispatch shape so the WhatsApp side can be tested
-      // end-to-end before the Integrator is wired in.
-      log.warn("integrator.stub", { endpoint: name });
-      return {
-        name,
-        async run(prompt: string) {
-          return {
-            text: `[stub:${name}] received: ${prompt.slice(0, 80)}`,
-            mediaRefs: [],
-          };
-        },
-      };
-    });
+  const factory: AdapterFactory = globalThis.INFINITY_INTEGRATOR_ADAPTERS!;
 
   const dispatcher = new Dispatcher(adapter, factory, log);
   dispatcher.bind();

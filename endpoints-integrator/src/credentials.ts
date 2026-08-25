@@ -5,6 +5,12 @@
 // Credentials object. Adapters receive ctx.credentials — they never read
 // process.env directly. On a missing key, raise AuthError with the key name
 // and which adapter demanded it; never silently retry.
+//
+// INFA-17: `QWEN_API_KEY` was removed when the Qwen dispatcher became
+// local-CLI only (dispatcher/qwen.js uses `qwen -m qwen3:30b-a3b -p`).
+// There is no cloud credential for Qwen anymore. The `qwen` slot on
+// `Credentials` is preserved as a vestigial shape so legacy callers
+// don't crash; `apiKey` is always "" and `baseUrl` is informational.
 // =============================================================================
 
 import * as fs from "node:fs";
@@ -13,7 +19,6 @@ import * as path from "node:path";
 // --- public types -----------------------------------------------------------
 
 export type KeyName =
-  | "QWEN_API_KEY"
   | "PERPLEXITY_REASONING_API_KEY"
   | "PERPLEXITY_DEEP_RESEARCH_API_KEY"
   | "FIRECRAWL_API_KEY"
@@ -51,7 +56,8 @@ export class AuthError extends Error {
 // --- loader -----------------------------------------------------------------
 
 const DEFAULTS: Record<string, string> = {
-  QWEN_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  // Qwen defaults live in dispatcher/qwen.js (QWEN_BIN / QWEN_MODEL).
+  // INTENTIONALLY EMPTY HERE — there is no QWEN_BASE_URL after INFA-17.
   PERPLEXITY_REASONING_MODEL: "sonar-reasoning-pro",
   PERPLEXITY_DEEP_RESEARCH_MODEL: "sonar-deep-research",
   FIRECRAWL_BASE_URL: "https://api.firecrawl.dev",
@@ -113,19 +119,24 @@ function lookup<T extends string>(
  *
  * @param envPath absolute path to .env (defaults to <cwd>/.env)
  * @param which subset of adapters being loaded — controls which keys we
- *              validate strictly. Pass `["qwenCode", "firecrawl"]` etc.
+ *              validate strictly. Pass `["perplexityReasoning", "firecrawl"]`
+ *              etc. `"qwenCode"` was removed in INFA-17 because the Qwen
+ *              dispatcher is local-CLI only and needs no credential.
  */
 export function loadCredentials(
   envPath: string = path.resolve(process.cwd(), ".env"),
-  which: AdapterKey[] = ["qwenCode", "perplexityReasoning", "perplexityDeepResearch", "firecrawl", "voiceMedia"],
+  which: AdapterKey[] = ["perplexityReasoning", "perplexityDeepResearch", "firecrawl", "voiceMedia"],
 ): Credentials {
   const file = readDotenv(envPath);
 
-  // Endpoints Integrator keys
-  const qwenKey = which.includes("qwenCode")
-    ? requireKey(file, "QWEN_API_KEY", "qwenCode",
-        "issue a key at https://dashscope.aliyuncs.com/apiKey and add it to .env")
-    : (readKey(file, "QWEN_API_KEY") ?? "");
+  // Endpoints Integrator keys.
+  //
+  // The Qwen dispatcher is now LOCAL-CLI only (dispatcher/qwen.js) and needs
+  // no credential. `qwen` on the returned object is preserved only so legacy
+  // callers don't crash; `apiKey` is always "" and `baseUrl` is informational.
+  const qwenKey = ""; // OBSOLETE — Qwen is local CLI only (INFA-17).
+  // Single Perplexity key covers both models; the runtime dispatcher lets
+  // each adapter select its own model id.
   const rpKey = which.includes("perplexityReasoning")
     ? requireKey(file, "PERPLEXITY_REASONING_API_KEY", "perplexityReasoning",
         "issue a key at https://www.perplexity.ai/settings/api")
@@ -152,7 +163,7 @@ export function loadCredentials(
   }
 
   return {
-    qwen: { apiKey: qwenKey, baseUrl: lookup<string>(file, "QWEN_BASE_URL") },
+    qwen: { apiKey: qwenKey, baseUrl: "" /* OBSOLETE — see INFA-17 */ },
     perplexityReasoning: { apiKey: rpKey, model: lookup<string>(file, "PERPLEXITY_REASONING_MODEL") },
     perplexityDeepResearch: { apiKey: drKey, model: lookup<string>(file, "PERPLEXITY_DEEP_RESEARCH_MODEL") },
     firecrawl: { apiKey: fcKey, baseUrl: lookup<string>(file, "FIRECRAWL_BASE_URL") },
@@ -166,7 +177,6 @@ export function loadCredentials(
 }
 
 export type AdapterKey =
-  | "qwenCode"
   | "perplexityReasoning"
   | "perplexityDeepResearch"
   | "firecrawl"

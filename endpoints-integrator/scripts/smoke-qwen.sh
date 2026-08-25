@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Smoke-test the Qwen Code (DashScope) endpoint.
-# Source the vault first: `set -a; source ../.env; set +a` or export QWEN_API_KEY.
+# Smoke-test the local Qwen Code CLI.
 # Usage: ./smoke-qwen.sh
+#
+# INFA-17: Qwen is local-CLI only. The CLI is invoked as
+#   qwen -m qwen3:30b-a3b -p "[PROMPT]"
+# Override the binary via QWEN_BIN and the model via QWEN_MODEL.
 set -euo pipefail
 
-: "${QWEN_API_KEY:?QWEN_API_KEY must be set (see .env.example)}"
-: "${QWEN_BASE_URL:=https://dashscope.aliyuncs.com/compatible-mode/v1}"
+: "${QWEN_BIN:=qwen}"
+: "${QWEN_MODEL:=qwen3:30b-a3b}"
 
-curl -sS -X POST \
-  -H "Authorization: Bearer ${QWEN_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -H "X-Request-Id: smoke-qwen-$(date +%s)" \
-  "${QWEN_BASE_URL}/chat/completions" \
-  -d '{
-    "model": "qwen-coder",
-    "messages": [{"role": "user", "content": "Reply with the single word: ok"}]
-  }' | jq .
+"${QWEN_BIN}" -m "${QWEN_MODEL}" -p "Reply with the single word: ok"

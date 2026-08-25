@@ -13,10 +13,14 @@ infinity/
   src/
     credentials.ts     # loader — see below
     adapters/
-      qwenCode.ts
       perplexityReasoning.ts
       perplexityDeepResearch.ts
       firecrawl.ts
+  dispatcher/          # runtime JS dispatcher (consumed by register.js)
+    qwen.js            # local Qwen CLI — NO credentials required
+    perplexity.js
+    firecrawl.js
+    shared.js
 ```
 
 The loader reads `.env` once at process start, validates that every key required
@@ -29,12 +33,18 @@ caller forgot to wire something up.
 
 | Key in vault                          | Owner agent               | Used by adapter                  | Rotation cadence                       |
 | ------------------------------------- | ------------------------- | -------------------------------- | -------------------------------------- |
-| `QWEN_API_KEY`                        | Endpoints Integrator      | `qwenCode.ts`                    | 90 days (or on suspected leak)         |
+| `QWEN_BIN` / `QWEN_MODEL` *(not secrets)* | Endpoints Integrator   | `dispatcher/qwen.js` (local CLI) | n/a — config, not credentials          |
 | `PERPLEXITY_REASONING_API_KEY`        | Endpoints Integrator      | `perplexityReasoning.ts`         | 90 days                                |
 | `PERPLEXITY_DEEP_RESEARCH_API_KEY`    | Endpoints Integrator      | `perplexityDeepResearch.ts`      | 90 days                                |
 | `FIRECRAWL_API_KEY`                   | Endpoints Integrator      | `firecrawl.ts`                   | 180 days (higher-entropy key)          |
 | `OPENAI_WHISPER_API_KEY`              | Voice & Media Engineer    | presence-checked at boot         | 180 days                               |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` | Voice & Media Engineer | presence-checked at boot         | 180 days                               |
+
+Note: the Qwen dispatcher is **local-only** as of INFA-17. There is no
+`QWEN_API_KEY` — the adapter spawns the `qwen` CLI
+(`qwen -m qwen3:30b-a3b -p "[PROMPT]"`). `QWEN_BIN` lets you override the
+binary path and `QWEN_MODEL` overrides the model; both default to the
+values in `dispatcher/qwen.js`.
 
 Why split Perplexity into two slots? Perplexity's console issues one key per
 account, but keeping two env vars lets us rotate or revoke one product
@@ -61,13 +71,15 @@ first, smoke-test second.
 needs. Missing keys raise a single, structured error:
 
 ```
-AuthError: missing credential "QWEN_API_KEY"
-  → required by adapter "qwenCode" (group: Qwen)
-  → issue a new key in the DashScope console, then add it to .env
+AuthError: missing credential "PERPLEXITY_API_KEY"
+  → required by adapter "perplexityReasoning"
+  → issue a key at https://www.perplexity.ai/settings/api, then add it to .env
 ```
 
 This is the contract every adapter's `run()` honours. Adapters must not
-silently retry on `AuthError`.
+silently retry on `AuthError`. The Qwen dispatcher does **not** call
+`requireKey()` — its only "auth" surface is the local CLI; if `qwen` is not
+on `PATH`, the adapter throws a regular `Error` with a pointer to `QWEN_BIN`.
 
 ## What the vault is NOT
 
