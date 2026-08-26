@@ -130,6 +130,32 @@ set -a; source .env; set +a
 ./scripts/smoke-firecrawl.sh
 ```
 
+## Deploy note: dual-tree copy (INFA-24)
+
+The runtime daemon loads this package from a *non-git snapshot* at
+`/paperclip/instances/default/workspaces/06a1c280-…/infinity/`, not from the
+git checkout in `d1a31c3e-…`. When you commit a fix here, you MUST also copy
+the changed files into the agent-workspace tree, otherwise the daemon keeps
+running the stale code and the user sees the same error after every "fix".
+
+Quick sync command (run from this repo root):
+
+```bash
+SRC=/paperclip/instances/default/workspaces/d1a31c3e-87c9-4dbc-b3cd-73e3dee95ae5/infinity/endpoints-integrator
+DST=/paperclip/instances/default/workspaces/06a1c280-6f20-443c-93b0-48e9e50190af/infinity
+cp -af "$SRC/dispatcher/." "$DST/dispatcher/"
+cp -af "$SRC/src/."      "$DST/src/"
+cp -af "$SRC/test/."     "$DST/test/"
+cp -af "$SRC/scripts/."  "$DST/scripts/"
+cp -af "$SRC/docs/."     "$DST/docs/"
+cp -af "$SRC/register.js" "$DST/register.js"
+cp -af "$SRC/README.md"  "$DST/README.md"
+( cd "$DST" && node --test test/ )
+```
+
+Then post a status comment on the issue so the operator knows to restart the
+daemon and re-test.
+
 ## Boundaries (recap)
 
 - Outbound text only — no WhatsApp I/O, no transcription, no TTS.
