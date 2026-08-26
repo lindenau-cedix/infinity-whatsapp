@@ -94,10 +94,32 @@ async function run(prompt, ctx = {}) {
   if (!ctx.model) {
     throw new Error('perplexity: ctx.model is required (e.g. "sonar-reasoning-pro")');
   }
-  const apiKey = ctx.apiKey || envKey('PERPLEXITY_API_KEY', {
-    adapter: `perplexity/${ctx.model}`,
-    hint: 'issue a key at https://www.perplexity.ai/settings/api and set PERPLEXITY_API_KEY',
-  });
+  // Resolve API key from ctx first, then the canonical shared var, then the
+  // per-model overrides documented in endpoints-integrator/.env.example
+  // (PERPLEXITY_REASONING_API_KEY / PERPLEXITY_DEEP_RESEARCH_API_KEY). The
+  // per-model keys are how operators actually set secrets today, so we MUST
+  // honour them — otherwise every group except Qwen falls through to the
+  // missing-credential stub and looks silently broken (INFA-20).
+  const perModelEnv =
+    ctx.model === 'sonar-deep-research'
+      ? 'PERPLEXITY_DEEP_RESEARCH_API_KEY'
+      : 'PERPLEXITY_REASONING_API_KEY';
+  const resolveApiKey = () =>
+    ctx.apiKey ||
+    process.env.PERPLEXITY_API_KEY ||
+    process.env[perModelEnv];
+
+  // Stub fallback (INFA-20): if no API key is configured, return a friendly
+  // visible reply instead of throwing AuthError. Qwen works without env
+  // keys; Perplexity + Firecrawl need explicit credentials, and a silent
+  // empty reply from these groups makes the system look broken. Surfacing
+  // the missing-credential hint here gives the operator immediate feedback
+  // without changing the contract for live calls (a real key still flows
+  // through to callPerplexity() below).
+  if (!resolveApiKey()) {
+    return stubMissingCredential(ctx.model);
+  }
+  const apiKey = resolveApiKey();
   const model = pickModel(ctx.model);
   const baseUrl = ctx.baseUrl || process.env.PERPLEXITY_BASE_URL || DEFAULT_BASE_URL;
   const requestId = ctx.requestId || `perp-${Date.now()}`;
@@ -123,4 +145,30 @@ async function run(prompt, ctx = {}) {
   return trimForReply(text);
 }
 
-module.exports = { run, callPerplexity, DEFAULT_BASE_URL, DEFAULT_MODELS };
+/**
+ * Visible stub reply used when no PERPLEXITY_API_KEY is configured. Echoes
+ * the prompt back so the operator can confirm the routing works (group →
+ * endpoint) and surfaces the missing-key hint inline. INFA-20 contract:
+ * never leave a configured group silent.
+ */
+function stubMissingCredential(model) {
+  const friendly = model === 'sonar-deep-research'
+    ? 'Perplexity Deep Research'
+    : 'Perplexity Sonar Reasoning Pro';
+  const perModelEnv = model === 'sonar-deep-research'
+    ? 'PERPLEXITY_DEEP_RESEARCH_API_KEY'
+    : 'PERPLEXITY_REASONING_API_KEY';
+  return (
+    `🔧 *${friendly}* (Stub)\n\n` +
+    `Dieser Endpoint ist verdrahtet, aber es fehlt der API-Key.\n\n` +
+    `So aktivierst du ihn:\n` +
+    `  1. Key holen: https://www.perplexity.ai/settings/api\n` +
+    `  2. Setzen (eine Variante genügt):\n` +
+    `     \`export PERPLEXITY_API_KEY=…\`\n` +
+    `     \`export ${perModelEnv}=…\`\n` +
+    `  3. WhatsApp-Client neu starten.\n\n` +
+    `Bis dahin bekommst du diesen Stub statt einer echten Antwort.`
+  );
+}
+
+module.exports = { run, callPerplexity, DEFAULT_BASE_URL, DEFAULT_MODELS, stubMissingCredential };

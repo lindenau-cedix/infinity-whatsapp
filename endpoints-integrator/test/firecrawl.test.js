@@ -47,12 +47,33 @@ test('firecrawl: returns a friendly hint when no URL is present', async () => {
   });
 });
 
-test('firecrawl: missing api key throws AuthError', async () => {
+test('firecrawl: missing api key returns a friendly stub (INFA-20)', async () => {
   await withEnv({ FIRECRAWL_API_KEY: '' }, async () => {
-    await assert.rejects(
-      () => real.run('crawl https://example.com', {}),
-      (err) => err.name === 'AuthError' && err.key === 'FIRECRAWL_API_KEY',
-    );
+    // INFA-20 contract change: instead of bubbling an AuthError that the
+    // dispatcher turns into an opaque "Fehler bei …" reply, the adapter
+    // returns a localized stub so the operator sees something useful
+    // immediately and knows exactly which key to set.
+    const text = await real.run('crawl https://example.com', {});
+    assert.match(text, /Firecrawl/i);
+    assert.match(text, /FIRECRAWL_API_KEY/);
+    assert.match(text, /Stub/i);
+    // The detected URL is echoed back so routing is observable.
+    assert.match(text, /example\.com/);
+  });
+});
+
+test('firecrawl: ctx.apiKey is honored even when env key is missing', async () => {
+  await withEnv({ FIRECRAWL_API_KEY: '' }, async () => {
+    const restore = fakeFetch({
+      [URL]: () => okJson({ data: { markdown: 'm body', metadata: { title: 'T' } } }),
+    });
+    try {
+      const text = await real.run('crawl https://example.com', { apiKey: 'ctx-supplied-key' });
+      assert.match(text, /\*T\*/);
+      assert.match(text, /m body/);
+    } finally {
+      restore();
+    }
   });
 });
 

@@ -129,10 +129,32 @@ test('register: firecrawl.run extracts URL and posts to /v1/scrape', async () =>
   });
 });
 
-test('register: surfaces AuthError from underlying dispatch', async () => {
+test('register: returns a friendly stub when the API key is missing (INFA-20)', async () => {
   await withEnv({ PERPLEXITY_API_KEY: '' }, async () => {
     const a = adapterFactory('perplexityReasoning');
-    await assert.rejects(() => a.run('hi', { requestId: 'r-x', group: 'Perp. RP' }),
-      (err) => err.name === 'AuthError');
+    const reply = await a.run('hi', { requestId: 'r-x', group: 'Perp. RP' });
+    // INFA-20 contract: never leave a configured group silent. When
+    // PERPLEXITY_API_KEY is unset the adapter returns a localized stub
+    // telling the operator how to fix the credential gap, instead of
+    // bubbling an AuthError into the dispatcher (which would otherwise
+    // surface as an opaque "Fehler bei …" reply in WhatsApp).
+    assert.match(reply.text, /Perplexity/i);
+    assert.match(reply.text, /PERPLEXITY_API_KEY/);
+    assert.match(reply.text, /Stub/i);
+  });
+});
+
+test('register: returns a friendly stub for firecrawl when FIRECRAWL_API_KEY is missing (INFA-20)', async () => {
+  await withEnv({ FIRECRAWL_API_KEY: '' }, async () => {
+    const a = adapterFactory('firecrawl');
+    const reply = await a.run('summarize https://example.com', {
+      requestId: 'r-y',
+      group: 'Firecrawl',
+    });
+    assert.match(reply.text, /Firecrawl/i);
+    assert.match(reply.text, /FIRECRAWL_API_KEY/);
+    assert.match(reply.text, /Stub/i);
+    // URL is echoed back so the operator can confirm routing works.
+    assert.match(reply.text, /example\.com/);
   });
 });

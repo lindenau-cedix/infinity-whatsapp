@@ -45,12 +45,36 @@ test('perplexity: successful reasoning call returns message content', async () =
   });
 });
 
-test('perplexity: missing api key throws AuthError', async () => {
+test('perplexity: missing api key returns a friendly stub (INFA-20)', async () => {
   await withEnv({ PERPLEXITY_API_KEY: '' }, async () => {
-    await assert.rejects(
-      () => real.run('hello', { model: 'sonar-reasoning-pro' }),
-      (err) => err.name === 'AuthError' && err.key === 'PERPLEXITY_API_KEY',
-    );
+    // INFA-20 contract change: instead of bubbling an AuthError that the
+    // dispatcher turns into an opaque "Fehler bei …" reply, the adapter
+    // returns a localized stub so the operator sees something useful
+    // immediately and knows exactly which key to set.
+    const text = await real.run('hello', { model: 'sonar-reasoning-pro' });
+    assert.match(text, /Perplexity/i);
+    assert.match(text, /PERPLEXITY_API_KEY/);
+    assert.match(text, /Stub/i);
+  });
+});
+
+test('perplexity: ctx.apiKey is honored even when env key is missing', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: '' }, async () => {
+    // Passing apiKey through ctx must still route to a live call, never
+    // hit the missing-key stub. INFA-20 only short-circuits when both
+    // ctx.apiKey and the env var are absent.
+    const restore = fakeFetch({
+      [URL]: () => okJson({ choices: [{ message: { content: 'ctx-key-ok' } }] }),
+    });
+    try {
+      const text = await real.run('hello', {
+        model: 'sonar-reasoning-pro',
+        apiKey: 'ctx-supplied-key',
+      });
+      assert.equal(text, 'ctx-key-ok');
+    } finally {
+      restore();
+    }
   });
 });
 

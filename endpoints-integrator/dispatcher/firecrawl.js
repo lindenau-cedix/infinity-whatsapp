@@ -73,6 +73,13 @@ async function run(prompt, ctx = {}) {
     throw new TypeError('firecrawl: prompt must be a string');
   }
   const target = extractUrl(prompt);
+  // Stub fallback (INFA-20): if no API key is configured, return a friendly
+  // visible reply instead of throwing AuthError. Mirrors the contract used
+  // by the Perplexity adapter so non-Qwen groups never look silently dead.
+  // Qwen works without env keys; Firecrawl needs FIRECRAWL_API_KEY.
+  if (!ctx.apiKey && !process.env.FIRECRAWL_API_KEY) {
+    return stubMissingCredential(target);
+  }
   if (!target) {
     return 'Firecrawl adapter needs a URL. Try: `scrape https://example.com`';
   }
@@ -100,4 +107,26 @@ async function run(prompt, ctx = {}) {
   return `*${title}*\n\n${head}`;
 }
 
-module.exports = { run, callFirecrawl, DEFAULT_BASE_URL, extractUrl };
+/**
+ * Visible stub reply used when no FIRECRAWL_API_KEY is configured. Echoes
+ * the URL (if any) back so the operator can confirm the routing works and
+ * surfaces the missing-key hint inline. INFA-20 contract: never leave a
+ * configured group silent.
+ */
+function stubMissingCredential(target) {
+  const urlLine = target
+    ? `Erkannte URL: ${target}\n\n`
+    : 'Tipp: schick eine URL wie `scrape https://example.com`.\n\n';
+  return (
+    `🔧 *Firecrawl* (Stub)\n\n` +
+    `Dieser Endpoint ist verdrahtet, aber es fehlt der API-Key.\n\n` +
+    urlLine +
+    `So aktivierst du ihn:\n` +
+    `  1. Key holen: https://firecrawl.dev\n` +
+    `  2. Setzen:  \`export FIRECRAWL_API_KEY=…\`\n` +
+    `  3. WhatsApp-Client neu starten.\n\n` +
+    `Bis dahin bekommst du diesen Stub statt einer echten Antwort.`
+  );
+}
+
+module.exports = { run, callFirecrawl, DEFAULT_BASE_URL, extractUrl, stubMissingCredential };

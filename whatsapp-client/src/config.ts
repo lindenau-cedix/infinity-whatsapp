@@ -92,7 +92,43 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): {
     logLevel: (env.LOG_LEVEL ?? "info") as RuntimeConfig["logLevel"],
   };
 
+  // Surface missing non-Qwen credentials so the operator sees the problem at
+  // boot rather than discovering it when the first prompt silently stubs
+  // (INFA-20). Qwen is local and needs no key — only the three HTTP-based
+  // adapters are checked here. This is a soft warning, not a fatal error,
+  // so existing setups keep working and the missing-key stub still answers
+  // individual messages at runtime.
+  warnMissingCredentials(env);
+
   return { groups, runtime };
+}
+
+/**
+ * Log a single boot-time warning listing any non-Qwen endpoint whose API
+ * key is absent. We don't fail the boot — the per-message stub fallback
+ * already covers the live case — but operators who only see "Qwen works"
+ * need an explicit nudge here to understand that the other three groups
+ * are stubbing because of missing config, not because of a wiring bug.
+ */
+function warnMissingCredentials(env: NodeJS.ProcessEnv): void {
+  const has = (k: string) => (env[k] ?? "").trim().length > 0;
+  const missing: string[] = [];
+  if (!has("PERPLEXITY_API_KEY") && !has("PERPLEXITY_REASONING_API_KEY")) {
+    missing.push("PERPLEXITY_API_KEY (or PERPLEXITY_REASONING_API_KEY)");
+  }
+  if (!has("PERPLEXITY_API_KEY") && !has("PERPLEXITY_DEEP_RESEARCH_API_KEY")) {
+    missing.push("PERPLEXITY_DEEP_RESEARCH_API_KEY");
+  }
+  if (!has("FIRECRAWL_API_KEY")) {
+    missing.push("FIRECRAWL_API_KEY");
+  }
+  if (missing.length === 0) return;
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[infinity] boot warning: ${missing.length} non-Qwen endpoint credential(s) missing ` +
+      `→ groups will reply with a stub until set: ${missing.join(", ")}. ` +
+      `Edit .env and restart.`,
+  );
 }
 
 /**

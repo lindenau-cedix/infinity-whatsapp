@@ -133,11 +133,15 @@ test('dispatch: forwards ctx.mediaPaths unchanged through adapter boundary', asy
   });
 });
 
-test('dispatch: surfaces adapter error when api key missing', async () => {
+test('dispatch: returns friendly stub when api key missing (INFA-20)', async () => {
   await withEnv({ PERPLEXITY_API_KEY: '' }, async () => {
-    await assert.rejects(
-      () => dispatchFn('perplexity-reasoning-pro', 'hi', {}),
-      (err) => err.name === 'AuthError',
-    );
+    // INFA-20 contract change: the dispatcher surface used to bubble
+    // AuthError from the perplexity adapter. After the fix the same call
+    // resolves with a localized stub reply, so a configured group is
+    // never silently dead. This test pins the new contract.
+    const text = await dispatchFn('perplexity-reasoning-pro', 'hi', {});
+    assert.match(text, /Perplexity/i);
+    assert.match(text, /PERPLEXITY_API_KEY/);
+    assert.match(text, /Stub/i);
   });
 });
