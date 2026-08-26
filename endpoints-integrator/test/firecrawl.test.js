@@ -49,6 +49,8 @@ test('firecrawl: extracts URL from prompt and returns title + markdown', async (
 });
 
 test('firecrawl: free-form prompt — Qwen picks URL, then /v1/scrape is called with it', async () => {
+  // Phrased as a direct-fetch imperative so it stays on Path 2 (free-form
+  // single-pick). Research-shaped phrasings now escalate to Path 3.
   const qwen = await fakeQwenCli({
     reply: '```json\n{"url":"https://www.trackingmore.com/en/tracking-api.html","reason":"good tracking API"}\n```',
   });
@@ -67,7 +69,7 @@ test('firecrawl: free-form prompt — Qwen picks URL, then /v1/scrape is called 
         },
       });
       try {
-        const text = await real.run('Look up the best API for package tracking.', { requestId: 'r-2' });
+        const text = await real.run('fetch the trackingmore tracking api page', { requestId: 'r-2' });
         assert.match(text, /\*TrackingMore API\*/);
         assert.match(text, /Best tracking API overview/);
         assert.match(text, /Quelle gewählt von Qwen/);
@@ -116,8 +118,10 @@ test('firecrawl: free-form prompt — Qwen reply not parseable JSON → clear er
 });
 
 test('firecrawl: free-form prompt — Qwen CLI missing → operator-friendly hint (no throw)', async () => {
+  // Direct-fetch imperative so it stays on Path 2. Research-shaped phrasings
+  // now escalate to Path 3 and surface a different message.
   await withEnv({ FIRECRAWL_API_KEY: 'fc-test', QWEN_BIN: '/nonexistent/qwen-xyz' }, async () => {
-    const text = await real.run('Look up the best pizza in Berlin', { requestId: 'r-5' });
+    const text = await real.run('fetch the pizza berlin page', { requestId: 'r-5' });
     assert.match(text, /Fehler bei der Qwen-Planung/);
     assert.match(text, /qwen CLI not found/);
   });
@@ -218,9 +222,21 @@ test('firecrawl: looksLikeResearchQuestion triggers on "?" + question word + len
     real.looksLikeResearchQuestion('Bitte liste mir die wichtigsten Vorteile von PostgreSQL gegenüber MySQL auf'),
     true,
   );
+  // Comparative / superlative phrasings — escalate even without a "?" (the
+  // INFA-23 reopened report: "what is the cheapest allnet flat?" without the
+  // question mark must still land on Path 3).
+  assert.equal(real.looksLikeResearchQuestion('cheapest allnet flat'), true);
+  assert.equal(real.looksLikeResearchQuestion('cheapest allnet flat.'), true);
+  assert.equal(real.looksLikeResearchQuestion('best pizza in berlin'), true);
+  assert.equal(real.looksLikeResearchQuestion('iphone 15 review'), true);
+  assert.equal(real.looksLikeResearchQuestion('was ist die günstigste allnet flat'), true);
+  // Info-seeking verbs — escalate.
+  assert.equal(real.looksLikeResearchQuestion('find cheapest allnet flat'), true);
+  assert.equal(real.looksLikeResearchQuestion('empfehl mir einen preiswerten tarif'), true);
   // Short imperative = single-page intent, NOT research.
   assert.equal(real.looksLikeResearchQuestion('scrape https://x.test'), false);
   assert.equal(real.looksLikeResearchQuestion('fetch docs'), false);
+  assert.equal(real.looksLikeResearchQuestion('show me cnn.com'), false);
   assert.equal(real.looksLikeResearchQuestion('Pizza Berlin'), false);
   assert.equal(real.looksLikeResearchQuestion(''), false);
 });
@@ -456,6 +472,79 @@ test('firecrawl: research — honours FIRECRAWL_RECURSE_MAX_CHARS env override',
         }
       },
     );
+  } finally {
+    await qwen.cleanup();
+  }
+});
+
+test('firecrawl: research — retries with a derived query when the formulated query returns nothing', async () => {
+  // Qwen formulates a query that gets 0 hits; the pipeline should retry with
+  // the prefix-stripped fallback ("allnet flat" instead of "what is the
+  // cheapest allnet flat") and succeed on the second try.
+  const searchQueries = [];
+  const qwen = await fakeQwenCli({
+    replies: [
+      '{"query":"what is the cheapest allnet flat"}',
+      '{"picks":[{"url":"https://a.test","reason":"r"}]}',
+      'final composed answer',
+    ],
+  });
+  try {
+    await withEnv({ FIRECRAWL_API_KEY: 'fc-test', QWEN_BIN: qwen.binPath }, async () => {
+      const restore = fakeFetch({
+        [SEARCH_URL]: (init) => {
+          searchQueries.push(JSON.parse(init.body).query);
+          // First call (formulated query) returns 0; second call (fallback) returns hits.
+          if (searchQueries.length === 1) return okJson({ data: { web: [] } });
+          return okJson({ data: { web: [{ title: 'A', url: 'https://a.test', description: '' }] } });
+        },
+        [URL]: () => okJson({ data: { markdown: 'A page', metadata: { title: 'A' } } }),
+      });
+      try {
+        const text = await real.run('what is the cheapest allnet flat?', { requestId: 'r-retry' });
+        // First query was the formulated one; second was the derived one.
+        assert.equal(searchQueries[0], 'what is the cheapest allnet flat');
+        assert.match(searchQueries[1], /cheapest allnet flat/);
+        assert.match(text, /final composed answer/);
+      } finally {
+        restore();
+      }
+    });
+  } finally {
+    await qwen.cleanup();
+  }
+});
+
+test('firecrawl: research — Path-2 Qwen url:null falls back to the recursive pipeline', async () => {
+  // When the heuristic misses research-detection (e.g. a short prompt that
+  // Path 2 picks up first) and Qwen then says "I can't pick a URL", the
+  // adapter now falls through to the research pipeline instead of leaving
+  // the user with a dead-end message. The breadcrumb makes the fallback
+  // visible so the user can tell what changed.
+  const qwen = await fakeQwenCli({
+    replies: [
+      '{"url":null,"reason":"keine passende offizielle Quelle"}',
+      '{"query":"pizza berlin"}',
+      '{"picks":[{"url":"https://p.test","reason":"r"}]}',
+      'composed answer',
+    ],
+  });
+  try {
+    await withEnv({ FIRECRAWL_API_KEY: 'fc-test', QWEN_BIN: qwen.binPath }, async () => {
+      const restore = fakeFetch({
+        [SEARCH_URL]: () => okJson({ data: { web: [{ title: 'P', url: 'https://p.test', description: '' }] } }),
+        [URL]: () => okJson({ data: { markdown: 'page', metadata: { title: 'P' } } }),
+      });
+      try {
+        // Short imperative-looking prompt that the heuristic still routes to
+        // Path 2 (no question word, no comparative, no research trigger).
+        const text = await real.run('pizza berlin tipp', { requestId: 'r-fallback' });
+        assert.match(text, /Hinweis.*Recherche-Pipeline/);
+        assert.match(text, /composed answer/);
+      } finally {
+        restore();
+      }
+    });
   } finally {
     await qwen.cleanup();
   }
