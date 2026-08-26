@@ -95,6 +95,8 @@ Tunables (env vars, all optional):
 | --- | --- | --- | --- |
 | `FIRECRAWL_SEARCH_LIMIT` | `5` | 1–10 | Max results `/v2/search` returns per source. |
 | `FIRECRAWL_PICK_TOP_K`   | `3` | 1–5  | How many of those Qwen is allowed to pick for the deep scrape. |
+| `FIRECRAWL_RECURSE_TOP_K` | `2` | 1–5  | Max NEW URLs Qwen may propose in the second round (the recursion step). |
+| `FIRECRAWL_RECURSE_MAX_DEPTH` | `1` | 0–3 | Recursion depth. `0` disables round 2 (single scrape round). |
 | `FIRECRAWL_RECURSE_MAX_CHARS` | `12000` | 2000–40000 | Total markdown budget across all chosen sources before composition. |
 
 ## Adapter contract
