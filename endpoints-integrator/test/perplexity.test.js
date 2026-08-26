@@ -194,3 +194,49 @@ test('perplexity: deep-research model uses same endpoint', async () => {
     }
   });
 });
+
+test('perplexity: undici "fetch failed" with ECONNRESET cause is retried and surfaces the real code (INFA-24)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        // Mirror Node 18+ undici: TypeError("fetch failed") wrapping a
+        // ECONNRESET cause. Before INFA-24 the retry classifier ignored
+        // this and threw "all retries exhausted: fetch failed" with no
+        // signal what actually went wrong.
+        const cause = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-reasoning-pro' });
+      assert.match(text, /recovered/);
+      assert.equal(calls, 2, 'should have retried once after ECONNRESET');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: persistent ECONNRESET surfaces the underlying code in the error (INFA-24)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    global.fetch = async () => {
+      const cause = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-reasoning-pro' }),
+        (err) => /ECONNRESET/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)),
+      );
+    } finally {
+      restore();
+    }
+  });
+});
