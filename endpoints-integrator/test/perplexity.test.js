@@ -401,6 +401,61 @@ test('perplexity: deep-research bails early on persistent opaque failures with c
   });
 });
 
+test('perplexity: deep-research bails early on persistent UND_ERR_SOCKET (visible transport-cluster)', async () => {
+  // INFA-24 widen: a visible transport-cluster error (UND_ERR_SOCKET) used
+  // to burn the full retry budget because the operator "could already see
+  // something" — the envelope just said `fetch failed (UND_ERR_SOCKET)`
+  // with no hint. After the widen, two consecutive hits trip the same
+  // early-bail + connectivity-hint envelope as a fully-opaque cluster,
+  // because in both flavors the operator has no actionable response.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      // undici: wrapper says "fetch failed", inner cause has .name='UND_ERR_SOCKET'
+      const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /early bail/i.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
+      );
+      assert.equal(calls, 2, 'persistent visible transport-cluster should bail after 2 with the host-connectivity hint');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research recovers on first UND_ERR_SOCKET (transient socket drop)', async () => {
+  // INFA-24 widen sanity: a single visible transport-cluster hit followed
+  // by success MUST NOT trip the early-bail path. consecutiveUnreachable
+  // only reaches 1, well below opaqueBailAfter=2.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-from-socket' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-from-socket/);
+      assert.equal(calls, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
 test('perplexity: opaqueBailAfter option can disable early bail (INFA-24 deeper)', async () => {
   // Drive the dispatcher directly via the shared module so we can pass
   // opaqueBailAfter=Infinity and verify the legacy behaviour still works.

@@ -175,11 +175,21 @@ async function runWithRetry(fn, opts = {}) {
      * After `opaqueBailAfter` consecutive fully-opaque failures (default 2),
      * give up early and surface a host-connectivity hint instead. Set to
      * Infinity to disable.
+     *
+     * INFA-24 widens this: persistent *visible* transport-cluster failures
+     * (UND_ERR_SOCKET, UND_ERR_CONNECT_TIMEOUT, ECONNRESET-class codes, ...)
+     * are also a connectivity problem, not a transient blip. After
+     * `opaqueBailAfter` consecutive failures of either flavor we bail
+     * with the same host-connectivity hint.
      */
     opaqueBailAfter = 2,
   } = opts;
 
-  let consecutiveOpaque = 0;
+  // Counts consecutive failures that smell like host-connectivity trouble,
+  // either because they are fully-opaque (no diagnostic at all) OR because
+  // they carry a visible transport-cluster code/name. Either flavor
+  // triggers the early-bail + hint envelope after `opaqueBailAfter` hits.
+  let consecutiveUnreachable = 0;
 
   const shouldRetry = (err, status) => {
     if (err instanceof AuthError) return false; // never retry on bad creds
@@ -214,24 +224,24 @@ async function runWithRetry(fn, opts = {}) {
       lastErr = err;
       const status = err?.status;
       const retriable = shouldRetry(err, status);
-      // Track the "fully opaque" run separately. If we keep getting bare
-      // fetch-failed wrappers with no diagnostic, the host almost certainly
-      // can't reach the endpoint at all — burn the SLA window by retrying
-      // for the full attempts budget would just leave the operator waiting
-      // 20 minutes for the same opaque message.
-      if (isFullyOpaqueFetchFailure(err)) {
-        consecutiveOpaque += 1;
+      // Track the "unreachable cluster" run. Either fully-opaque wrappers
+      // (no diagnostic at all) OR visible transport-cluster failures
+      // (UND_ERR_SOCKET, ECONNRESET-class codes, ...) signal host-side
+      // connectivity trouble. Burning the full SLA window on either flavor
+      // just leaves the operator waiting for the same message.
+      if (isFullyOpaqueFetchFailure(err) || isTransportClusterError(err)) {
+        consecutiveUnreachable += 1;
       } else {
-        consecutiveOpaque = 0;
+        consecutiveUnreachable = 0;
       }
       clearTimeout(timer);
       if (!retriable || attempt === attempts) break;
-      // INFA-24 deeper: bail out early when we've accumulated
-      // `opaqueBailAfter` consecutive fully-opaque failures with no signal
-      // that anything is changing. The host is almost certainly offline to
-      // this endpoint; the operator needs a clear hint, not another 18
-      // minutes of identical errors.
-      if (consecutiveOpaque >= opaqueBailAfter) break;
+      // INFA-24 deeper / INFA-24 wider: bail out early when we've
+      // accumulated `opaqueBailAfter` consecutive unreachable-cluster
+      // failures with no signal that anything is changing. The host is
+      // almost certainly offline to this endpoint; the operator needs a
+      // clear hint, not another 18 minutes of identical errors.
+      if (consecutiveUnreachable >= opaqueBailAfter) break;
       // exponential backoff: base * 2^(attempt-1), with a tiny jitter
       const jitter = Math.floor(Math.random() * 80);
       const wait = baseDelayMs * 2 ** (attempt - 1) + jitter;
@@ -261,9 +271,20 @@ async function runWithRetry(fn, opts = {}) {
   // retry budget, the failure is almost certainly a host-connectivity issue
   // rather than a transient blip. Surface the connectivity hint inline so
   // the operator doesn't have to guess what's wrong.
+  //
+  // INFA-24 wider: a persistent *visible* transport-cluster error
+  // (UND_ERR_SOCKET / UND_ERR_CONNECT_TIMEOUT / ECONNRESET-class code / ...)
+  // has the same root cause — host can't reach this endpoint. The envelope
+  // gives the operator the same hint rather than a bare
+  // `fetch failed (UND_ERR_SOCKET)` they have no actionable response to.
   let envelopeMessage = 'all retries exhausted';
-  if (consecutiveOpaque >= opaqueBailAfter && isFullyOpaqueFetchFailure(lastErr)) {
-    envelopeMessage = `all retries exhausted (early bail: ${consecutiveOpaque} consecutive opaque fetch failures) — ${HOST_CONNECTIVITY_HINT}`;
+  const terminalUnreachable =
+    consecutiveUnreachable >= opaqueBailAfter &&
+    (isFullyOpaqueFetchFailure(lastErr) || isTransportClusterError(lastErr));
+  if (terminalUnreachable) {
+    envelopeMessage =
+      `all retries exhausted (early bail: ${consecutiveUnreachable} consecutive ` +
+      `unreachable-host failures) — ${HOST_CONNECTIVITY_HINT}`;
   }
   throw new DispatcherError(adapter, envelopeMessage, Object.assign(new Error(detail), {
     cause: lastErr,
@@ -271,6 +292,44 @@ async function runWithRetry(fn, opts = {}) {
     name: inner?.name || lastErr?.name,
     status: lastErr?.status,
   }));
+}
+
+// Names undici uses to wrap transport-layer socket / connect failures on the
+// `.cause.name` (or sometimes on the wrapper itself in older undici). Together
+// with RETRIABLE_NETWORK_CODES these are the "host almost certainly can't
+// reach this endpoint" error classes — when they cluster, treating the cluster
+// the same way we treat fully-opaque failures (early bail + connectivity
+// hint) saves the operator minutes of identical error traffic.
+const TRANSPORT_FATAL_NAMES = new Set([
+  'SocketError',
+  'ConnectTimeoutError',
+  'RequestAbortedError',
+  'ClientError',
+  'HeadersTimeoutError',
+  'BodyTimeoutError',
+  'ResponseExceededMaxSizeError',
+]);
+
+/**
+ * Return true when an unwrapped error chain looks like a host-side transport
+ * failure on a code-or-name basis — either it carries one of the canonical
+ * network codes (ECONNRESET, UND_ERR_SOCKET, ...), or its `.name` is one
+ * of the known undici transport-error classes. Fully-opaque wrappers with
+ * no signal anywhere are caught separately by `isFullyOpaqueFetchFailure`;
+ * this helper picks up the *visible-signal* cluster where the operator
+ * already sees `fetch failed (UND_ERR_SOCKET)` but the code insists the
+ * error isn't yet "obviously unreachable". Two consecutive hits of either
+ * flavor deserve the same treatment.
+ */
+function isTransportClusterError(err) {
+  if (!err) return false;
+  const inner = unwrapCause(err) || err;
+  if (inner?.code && RETRIABLE_NETWORK_CODES.has(inner.code)) return true;
+  if (inner?.name && TRANSPORT_FATAL_NAMES.has(inner.name)) return true;
+  // undici surfaces UND_ERR_* via `.name` on the inner error in some
+  // versions and via `.code` on the `.cause` in others. Cover both.
+  if (typeof inner?.name === 'string' && inner.name.startsWith('UND_ERR_')) return true;
+  return false;
 }
 
 /**
@@ -334,6 +393,7 @@ module.exports = {
   probeEndpoint,
   isFetchFailedWrapper,
   isFullyOpaqueFetchFailure,
+  isTransportClusterError,
   unwrapCause,
   HOST_CONNECTIVITY_HINT,
 };
