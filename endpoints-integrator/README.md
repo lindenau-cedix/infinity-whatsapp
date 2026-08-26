@@ -44,27 +44,58 @@ FIRECRAWL_API_KEY=...    ./scripts/smoke-firecrawl.sh
 ./scripts/smoke-qwen.sh
 ```
 
-## Firecrawl group — INFA-22 free-form prompts
+## Firecrawl group — free-form + recursive research (INFA-22 + INFA-23)
 
-The Firecrawl WhatsApp group accepts both shapes:
+The Firecrawl WhatsApp group accepts three execution shapes; the dispatcher
+selects the right one from the prompt:
 
-- A literal URL (legacy fast path): `scrape https://example.com` → Firecrawl
-  is called directly with that URL.
-- A free-form question (INFA-22): e.g. `Look up the best API for package
-  tracking.` → the local Qwen CLI picks a single URL that best answers the
-  question, then Firecrawl scrapes it. Qwen is told to reply with one JSON
-  line `{"url":"https://…"}` (or `{"url":null,"reason":"…"}` when it can't
-  decide) so the parser stays robust against fence / prose.
+- **URL-in-prompt (fast path).** `scrape https://example.com` → Firecrawl
+  `/v1/scrape` is called directly with that URL. No model call.
+- **Free-form pick-one (INFA-22).** Short imperative without a URL → the
+  local Qwen CLI picks **one** URL that best answers the question; we then
+  `/v1/scrape` it. Used for "fetch …" / "scrape …" requests.
+- **Recursive research (INFA-23).** Open research question (heuristic: `?`,
+  German/English question word, trigger phrases like "explain …" / "tell me
+  about …", or prompt length ≥ 60 chars, AND not starting with an imperative
+  fetch verb). Pipeline:
+  1. ask Qwen to derive a Google-style search query from the prompt,
+  2. POST Firecrawl `/v2/search` with `sources: ["web"]` and a small
+     `limit` (default 5),
+  3. ask Qwen to rank the results and pick the top K (default 3),
+  4. POST `/v1/scrape` for each chosen URL, bounded by
+     `FIRECRAWL_RECURSE_MAX_CHARS` so the final Qwen step stays within its
+     CLI argv budget (default 12 000 chars total),
+  5. ask Qwen to compose a pretty-formatted German answer with a `*Quellen*`
+     block at the end citing each source by title + URL.
 
-Smoke test:
+Every step has its own timeout. Failures surface inline — never a silent
+wrong URL. Provider errors are returned as friendly text rather than
+thrown, so the WhatsApp group stays visibly alive when the key is bad.
+
+Smoke tests:
 
 ```bash
-./scripts/smoke-firecrawl.sh url         # literal URL → /v1/scrape
-./scripts/smoke-firecrawl.sh freeform    # Qwen picks URL → /v1/scrape
+# Fast path / direct curl — no Qwen needed.
+./scripts/smoke-firecrawl.sh url
+
+# Search-only sanity check against the live API.
+./scripts/smoke-firecrawl.sh search
+
+# Free-form pick-one — needs the local `qwen` CLI on PATH (or QWEN_BIN).
+./scripts/smoke-firecrawl.sh freeform
+
+# Full recursive research pipeline (Qwen query → search → rank → scrape →
+# compose). Needs Qwen + a real Firecrawl key.
+./scripts/smoke-firecrawl.sh research
 ```
 
-The free-form mode needs the local `qwen` CLI on `PATH` (or `QWEN_BIN`).
-The URL-in-prompt mode has no Qwen dependency.
+Tunables (env vars, all optional):
+
+| Variable | Default | Range | Effect |
+| --- | --- | --- | --- |
+| `FIRECRAWL_SEARCH_LIMIT` | `5` | 1–10 | Max results `/v2/search` returns per source. |
+| `FIRECRAWL_PICK_TOP_K`   | `3` | 1–5  | How many of those Qwen is allowed to pick for the deep scrape. |
+| `FIRECRAWL_RECURSE_MAX_CHARS` | `12000` | 2000–40000 | Total markdown budget across all chosen sources before composition. |
 
 ## Adapter contract
 

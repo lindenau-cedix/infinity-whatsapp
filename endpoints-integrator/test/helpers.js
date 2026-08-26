@@ -72,8 +72,10 @@ function okText(text, status = 200) {
  * Write a fake `qwen` shell script to a temp file.
  * Returns { binPath, cleanup }. The script prints `reply` to stdout and exits 0.
  * If `failure` is provided the script writes `failure` to stderr and exits 1.
+ * If `replies` (array) is provided, each invocation consumes one entry from
+ * the FIFO, looping back to the start when the array is exhausted.
  */
-async function fakeQwenCli({ reply = 'ok from qwen', failure = null, extraArgs = [], delayMs = 0 } = {}) {
+async function fakeQwenCli({ reply = 'ok from qwen', failure = null, extraArgs = [], delayMs = 0, replies = null } = {}) {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'qwen-fake-'));
   const binPath = path.join(dir, 'qwen');
   const escapedReply = String(reply).replace(/'/g, `'\\''`);
@@ -107,7 +109,61 @@ async function fakeQwenCli({ reply = 'ok from qwen', failure = null, extraArgs =
     // dispatcher sees a clean stdout and can decide whether it counts as a reply.
     'printf "%s" "${reply}"',
   ];
-  await fs.promises.writeFile(binPath, lines.join('\n') + '\n', { mode: 0o755 });
+
+  let scriptBody = lines.join('\n') + '\n';
+
+  if (Array.isArray(replies) && replies.length > 0) {
+    // Per-invocation FIFO: print reply N, then reply N+1, ... looping.
+    // We use a NUL-free record marker that's unlikely to appear in JSON,
+    // and store each reply base64-encoded so multi-line strings survive
+    // intact (sh read loops split on newlines).
+    const SENTINEL = '|||INFINITY_QWEN_RECORD|||';
+    const encoded = replies.map((r) => Buffer.from(String(r), 'utf8').toString('base64'));
+    const fifoDir = path.join(dir, 'fifo');
+    fs.mkdirSync(fifoDir, { recursive: true });
+    const linesPath = path.join(fifoDir, 'records');
+    fs.writeFileSync(linesPath, encoded.join('\n') + '\n');
+
+    scriptBody = [
+      '#!/bin/sh',
+      '# Fake qwen CLI with a per-invocation reply FIFO.',
+      'delay_ms=' + delayMs,
+      "failure='" + String(failure || '').replace(/'/g, `'\\''`) + "'",
+      'prompt=""',
+      'while [ $# -gt 0 ]; do',
+      '  case "$1" in',
+      '    -p) prompt="$2"; shift 2 ;;',
+      '    *) shift ;;',
+      '  esac',
+      'done',
+      'if [ -n "$failure" ]; then',
+      '  printf "%s" "$failure" >&2',
+      '  exit 1',
+      'fi',
+      'if [ "$delay_ms" != "0" ]; then',
+      '  sleep "$(awk -v ms="$delay_ms" \'BEGIN{printf "%.3f", ms/1000}\')"',
+      'fi',
+      // Atomic rotate: mkdir lockdir is the lock primitive. Read first record,
+      // shift the rest, then re-append the record we just consumed so the
+      // queue cycles. Records are base64 + NUL-free so multi-line content
+      // (including JSON with newlines) survives intact.
+      'lockdir="' + fifoDir + '/lock"',
+      'queue="' + linesPath + '"',
+      'while ! mkdir "$lockdir" 2>/dev/null; do : ; done',
+      'trap "rmdir \\"$lockdir\\" 2>/dev/null" EXIT',
+      'rec=$(head -n 1 "$queue")',
+      'if [ -n "$rec" ]; then',
+      '  tail -n +2 "$queue" > "$queue.tmp" && mv "$queue.tmp" "$queue"',
+      '  echo "$rec" >> "$queue"',
+      'fi',
+      'rmdir "$lockdir"',
+      // base64-decode and print.
+      'printf "%s" "$(printf "%s" "$rec" | base64 -d 2>/dev/null)"',
+      '',
+    ].join('\n');
+  }
+
+  await fs.promises.writeFile(binPath, scriptBody, { mode: 0o755 });
   void extraArgs;
   return {
     binPath,
