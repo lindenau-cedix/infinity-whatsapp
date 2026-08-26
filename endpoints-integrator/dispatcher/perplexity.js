@@ -124,15 +124,20 @@ async function run(prompt, ctx = {}) {
   const baseUrl = ctx.baseUrl || process.env.PERPLEXITY_BASE_URL || DEFAULT_BASE_URL;
   const requestId = ctx.requestId || `perp-${Date.now()}`;
 
-  // Deep research runs longer — give it more breathing room.
-  const timeoutMs = ctx.model === 'sonar-deep-research' ? 120_000 : 45_000;
+  // Deep research runs longer — Perplexity's docs say 30s–5min per call.
+  // 300s per-attempt with 4 attempts (1 + 3 retries) bounds a single deep-
+  // research call at ~20min worst case before we surface the failure to the
+  // operator, instead of giving up after 6min. Reasoning stays tight.
+  const isDeepResearch = ctx.model === 'sonar-deep-research';
+  const timeoutMs = isDeepResearch ? 300_000 : 45_000;
+  const attempts = isDeepResearch ? 4 : 3;
 
   const json = await runWithRetry(
     ({ signal }) => callPerplexity({ apiKey, model, prompt, requestId, baseUrl, signal }),
     {
       adapter: `perplexity/${ctx.model}`,
-      attempts: 3,
-      baseDelayMs: 400,
+      attempts,
+      baseDelayMs: 500,
       timeoutMs,
     },
   );

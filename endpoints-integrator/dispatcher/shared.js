@@ -57,6 +57,39 @@ function sleep(ms) {
  *   retryOn         array of status codes / error names that trigger retry
  *                   (default: network errors + 429 + 5xx)
  */
+// Network error codes (Node 18+ undici surfaces these on the `fetch failed`
+// TypeError's `.cause.code`). Treat any of them as retriable — they're all
+// transient transport failures, never an auth or contract problem.
+const RETRIABLE_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'ENETUNREACH',
+  'ECONNREFUSED',
+  'EPIPE',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+/**
+ * Walk an error's cause chain looking for the first entry with a useful
+ * `.code`. Node 18+ undici wraps low-level failures in
+ * `TypeError: fetch failed` with the real cause buried under `.cause` —
+ * without this helper, the operator only ever sees "fetch failed".
+ * We only honour `code` (never `name`) so plain `TypeError` / `Error`
+ * wrappers without a low-level code don't short-circuit the walk.
+ */
+function unwrapCause(err) {
+  let cur = err;
+  for (let i = 0; cur && i < 5; i++) {
+    if (cur.code) return cur;
+    cur = cur.cause;
+  }
+  return err;
+}
+
 async function runWithRetry(fn, opts = {}) {
   const {
     attempts = 3,
@@ -76,9 +109,10 @@ async function runWithRetry(fn, opts = {}) {
     }
     if (status === 429) return true;
     if (status && status >= 500 && status < 600) return true;
-    if (err && (err.name === 'AbortError' || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET')) {
-      return true;
-    }
+    // Unwrap undici's `fetch failed` wrapper so we see the real code/name.
+    const inner = unwrapCause(err) || err;
+    if (inner.name === 'AbortError') return true;
+    if (inner.code && RETRIABLE_NETWORK_CODES.has(inner.code)) return true;
     return false;
   };
 
@@ -102,7 +136,19 @@ async function runWithRetry(fn, opts = {}) {
       clearTimeout(timer);
     }
   }
-  throw new DispatcherError(adapter, 'all retries exhausted', lastErr);
+  // Surface the underlying cause chain so operators don't see "fetch failed"
+  // when the real error is ECONNRESET / EAI_AGAIN / etc. (INFA-24 fix.)
+  const inner = unwrapCause(lastErr) || lastErr;
+  const innerTag = inner?.code || (inner?.name && inner.name !== 'Error' && inner.name !== 'TypeError' ? inner.name : null);
+  const detail = innerTag
+    ? `${lastErr?.message || 'fetch failed'} (${innerTag})`
+    : (lastErr?.message || 'fetch failed');
+  throw new DispatcherError(adapter, 'all retries exhausted', Object.assign(new Error(detail), {
+    cause: lastErr,
+    code: inner?.code,
+    name: inner?.name || lastErr?.name,
+    status: lastErr?.status,
+  }));
 }
 
 function trimForReply(text, maxChars = 3500) {
