@@ -4,3 +4,4 @@ dist/
 .wa-session/
 media/
 *.log
+build-test/

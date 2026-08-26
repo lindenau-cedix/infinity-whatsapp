@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Unit tests for the trigger parser. Compiles the test source on the fly via
-# `tsc` with a tiny override config so we don't need a separate test runner
-# (mocha / vitest would balloon the install).
+# Unit tests for the trigger parser and the group-JID config validation.
+# Compiles the test sources on the fly via `tsc` with a tiny override config
+# so we don't need a separate test runner (mocha / vitest would balloon the
+# install).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,6 +20,6 @@ npx tsc \
   --strict \
   --outDir build-test \
   --rootDir . \
-  src/triggers.ts test/triggers.test.ts
+  src/triggers.ts src/config.ts test/triggers.test.ts test/config.test.ts
 
-node --test build-test/test/triggers.test.js
+node --test build-test/test/triggers.test.js build-test/test/config.test.js

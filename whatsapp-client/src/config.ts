@@ -57,10 +57,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): {
 } {
   ensureDotEnvLoaded(env);
 
-  const jidQwen = required("WA_GROUP_JID_QWEN", env);
-  const jidPerpRp = required("WA_GROUP_JID_PERP_RP", env);
-  const jidPerpDr = required("WA_GROUP_JID_PERP_DR", env);
-  const jidFirecrawl = required("WA_GROUP_JID_FIRECRAWL", env);
+  const jidQwen = requiredJid("WA_GROUP_JID_QWEN", env);
+  const jidPerpRp = requiredJid("WA_GROUP_JID_PERP_RP", env);
+  const jidPerpDr = requiredJid("WA_GROUP_JID_PERP_DR", env);
+  const jidFirecrawl = requiredJid("WA_GROUP_JID_FIRECRAWL", env);
+
+  // Two distinct groups pointing at the same JID is always a copy-paste
+  // error, and it silently steals traffic: findGroupByJid() returns the
+  // first match, so the later endpoint never receives a single message.
+  // Fail at boot rather than let one group shadow another (INFA-20).
+  assertDistinctJids({
+    WA_GROUP_JID_QWEN: jidQwen,
+    WA_GROUP_JID_PERP_RP: jidPerpRp,
+    WA_GROUP_JID_PERP_DR: jidPerpDr,
+    WA_GROUP_JID_FIRECRAWL: jidFirecrawl,
+  });
 
   const groups: Record<EndpointName, GroupConfig> = {
     qwenCode: {
@@ -144,6 +155,67 @@ export function findGroupByJid(
     if (cfg.jid === jid) return cfg;
   }
   return undefined;
+}
+
+/**
+ * Shape of a real WhatsApp group JID: all digits, then `@g.us`. Real group
+ * ids are ~18 digits and in practice start with `120363`, but we only
+ * enforce all-digits so the check never rejects a legitimately-formatted id
+ * from a future numbering scheme.
+ */
+const GROUP_JID_RE = /^\d+@g\.us$/;
+
+/**
+ * Like `required()`, but also rejects values that are not shaped like a
+ * WhatsApp group JID.
+ *
+ * This closes the hole that caused INFA-20. `.env` shipped with placeholder
+ * values (`120363_a@g.us` … `120363_d@g.us`) which are non-empty, so the old
+ * `required()` accepted them and the daemon booted "successfully". Every
+ * inbound message then failed `findGroupByJid()` and was dropped at the
+ * router, so three of the four groups never answered — not even the
+ * missing-credential stub, because nothing reached an adapter. The operator
+ * saw "only the Qwen group works" with no error anywhere pointing at .env.
+ *
+ * A malformed JID is unrecoverable at runtime, so we fail the boot instead of
+ * warning: a daemon that silently ignores three quarters of its traffic is
+ * worse than one that refuses to start with a precise reason.
+ */
+function requiredJid(name: string, env: NodeJS.ProcessEnv): string {
+  const raw = required(name, env);
+  if (!GROUP_JID_RE.test(raw)) {
+    throw new ConfigError(
+      `Env var ${name} is not a valid WhatsApp group JID: "${raw}". ` +
+        `Expected all digits followed by "@g.us" (e.g. 120363123456789012@g.us). ` +
+        `Placeholder values like "120363_a@g.us" look valid but silently break ` +
+        `routing: messages from that group are dropped and it never replies. ` +
+        `Get the real id from WhatsApp (group info → invite link, the code after ` +
+        `the last "/"), or run \`infinity-whatsapp --check-groups\` to print what ` +
+        `is currently configured.`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * Reject duplicate JIDs across the four endpoints. `findGroupByJid()` scans
+ * in object order and returns the first hit, so a duplicate makes the later
+ * endpoint permanently unreachable — the same "silently gets no traffic"
+ * class of bug as a malformed JID, and just as invisible at runtime.
+ */
+function assertDistinctJids(byEnvVar: Record<string, string>): void {
+  const seen = new Map<string, string>();
+  for (const [envVar, jid] of Object.entries(byEnvVar)) {
+    const prior = seen.get(jid);
+    if (prior) {
+      throw new ConfigError(
+        `Env vars ${prior} and ${envVar} are both set to the same JID "${jid}". ` +
+          `Each of the four groups needs its own distinct WhatsApp group; ` +
+          `otherwise only ${prior} receives traffic and ${envVar} never replies.`,
+      );
+    }
+    seen.set(jid, envVar);
+  }
 }
 
 function required(name: string, env: NodeJS.ProcessEnv): string {
