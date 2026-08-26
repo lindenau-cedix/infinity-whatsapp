@@ -55,7 +55,16 @@ function sleep(ms) {
  *   baseDelayMs     first backoff sleep (default 250)
  *   timeoutMs       per-attempt hard cap (default 20_000)
  *   retryOn         array of status codes / error names that trigger retry
- *                   (default: network errors + 429 + 5xx)
+ *                   (default: network errors + 429 + 5xx + undici `fetch failed`
+ *                   wrappers whose .cause has no useful diagnostic)
+ *
+ * Transport-failure handling (INFA-24):
+ *   undici wraps fetch-time failures as `TypeError('fetch failed')` (or, in
+ *   undici 22+, sometimes as a plain `Error('fetch failed')`) with the real
+ *   cause on `.cause`. The first iteration treated only code-bearing causes
+ *   as retriable; the second iteration (this one) also retries when the
+ *   wrapper itself is a `fetch failed` even with a null/opaque `.cause`, so
+ *   a single TLS race or proxy drop no longer kills the whole call.
  */
 // Network error codes (Node 18+ undici surfaces these on the `fetch failed`
 // TypeError's `.cause.code`). Treat any of them as retriable — they're all
@@ -75,19 +84,44 @@ const RETRIABLE_NETWORK_CODES = new Set([
 
 /**
  * Walk an error's cause chain looking for the first entry with a useful
- * `.code`. Node 18+ undici wraps low-level failures in
- * `TypeError: fetch failed` with the real cause buried under `.cause` —
- * without this helper, the operator only ever sees "fetch failed".
- * We only honour `code` (never `name`) so plain `TypeError` / `Error`
- * wrappers without a low-level code don't short-circuit the walk.
+ * diagnostic: a `.code` (ECONNRESET/EAI_AGAIN/...) or a `.name` that's
+ * neither the generic `Error`/`TypeError` nor a `fetch failed` wrapper.
+ *
+ * Node 18+ undici wraps low-level transport failures in
+ * `TypeError: fetch failed` (sometimes `Error: fetch failed` in undici 22+)
+ * with the real cause buried under `.cause`. In some TLS / proxy / keep-
+ * alive races the cause itself is `null` or a plain Error with no `.code`,
+ * and in those cases the wrapper message IS the only diagnostic. Without
+ * this helper the operator sees "fetch failed" with no signal why.
+ *
+ * We honour `code` first (most informative), then `name` (skips the generic
+ * wrappers, accepts anything informative), and fall back to the wrapper
+ * itself so its `.message` is still available downstream.
  */
 function unwrapCause(err) {
   let cur = err;
   for (let i = 0; cur && i < 5; i++) {
     if (cur.code) return cur;
+    if (cur.name && cur.name !== 'Error' && cur.name !== 'TypeError' && cur.name !== 'FetchError') return cur;
     cur = cur.cause;
   }
   return err;
+}
+
+/**
+ * Recognise undici's transport-failure wrapper as retriable even when the
+ * cause chain yields no useful code/name. undici surfaces fetch-time failures
+ * as `TypeError('fetch failed')` or, in undici 22+, sometimes as a plain
+ * `Error('fetch failed')`. We match by message (not by class) so wrapped
+ * copies (e.g. across module boundaries) still match.
+ */
+function isFetchFailedWrapper(err) {
+  return Boolean(
+    err &&
+    typeof err.message === 'string' &&
+    err.message.trim() === 'fetch failed' &&
+    (err.name === 'TypeError' || err.name === 'Error' || err.name === 'FetchError' || err.name === undefined)
+  );
 }
 
 async function runWithRetry(fn, opts = {}) {
@@ -113,6 +147,12 @@ async function runWithRetry(fn, opts = {}) {
     const inner = unwrapCause(err) || err;
     if (inner.name === 'AbortError') return true;
     if (inner.code && RETRIABLE_NETWORK_CODES.has(inner.code)) return true;
+    // INFA-24 follow-up: undici surfaces transport failures (TLS races,
+    // proxy drops, body-parser aborts, undici-22+ plain-Error wrapper) as
+    // a `fetch failed` wrapper whose `.cause` may be null or carry no
+    // `.code`. Treat the wrapper itself as a retriable transport failure
+    // — the alternative is giving up on a perfectly transient blip.
+    if (isFetchFailedWrapper(err) || isFetchFailedWrapper(inner)) return true;
     return false;
   };
 
@@ -136,13 +176,23 @@ async function runWithRetry(fn, opts = {}) {
       clearTimeout(timer);
     }
   }
-  // Surface the underlying cause chain so operators don't see "fetch failed"
-  // when the real error is ECONNRESET / EAI_AGAIN / etc. (INFA-24 fix.)
+  // Surface the underlying cause chain so operators don't see a bare
+  // "fetch failed" when the real error is ECONNRESET / EAI_AGAIN / a
+  // TLS-race AbortError / an undici socket drop. The envelope prefers
+  // (code > name > cause-message) so even opaque wrappers like undici-22+
+  // `Error('fetch failed')` with no .cause at least tell the operator
+  // "fetch failed (cause: <message>)" instead of a bare "fetch failed".
   const inner = unwrapCause(lastErr) || lastErr;
-  const innerTag = inner?.code || (inner?.name && inner.name !== 'Error' && inner.name !== 'TypeError' ? inner.name : null);
-  const detail = innerTag
-    ? `${lastErr?.message || 'fetch failed'} (${innerTag})`
-    : (lastErr?.message || 'fetch failed');
+  const innerTag = inner?.code
+    || (inner?.name && inner.name !== 'Error' && inner.name !== 'TypeError' && inner.name !== 'FetchError' ? inner.name : null);
+  let detail;
+  if (innerTag) {
+    detail = `${lastErr?.message || 'fetch failed'} (${innerTag})`;
+  } else if (lastErr?.cause && typeof lastErr.cause.message === 'string' && lastErr.cause.message.trim() !== 'fetch failed') {
+    detail = `${lastErr.message || 'fetch failed'} (cause: ${lastErr.cause.message})`;
+  } else {
+    detail = lastErr?.message || 'fetch failed';
+  }
   throw new DispatcherError(adapter, 'all retries exhausted', Object.assign(new Error(detail), {
     cause: lastErr,
     code: inner?.code,

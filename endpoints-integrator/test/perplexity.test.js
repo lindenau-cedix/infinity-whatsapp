@@ -240,3 +240,109 @@ test('perplexity: persistent ECONNRESET surfaces the underlying code in the erro
     }
   });
 });
+
+// INFA-24 follow-up: the original fix retried only when .cause had a known
+// .code. undici 22+ and several TLS/proxy races surface fetch-time failures
+// as `TypeError('fetch failed')` or even `Error('fetch failed')` with a
+// null or code-less .cause. The retry classifier now treats the wrapper
+// itself as retriable, so a single transient blip no longer kills the call.
+
+test('perplexity: "fetch failed" with no .cause at all is retried and recovers (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        // TLS race / proxy drop: undici throws TypeError("fetch failed")
+        // with .cause === undefined. Before the fix this aborted the call
+        // and surfaced "all retries exhausted: fetch failed".
+        throw new TypeError('fetch failed');
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-no-cause' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-no-cause/);
+      assert.equal(calls, 2, 'should have retried once after opaque fetch failed');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: "fetch failed" with cause carrying only .name is retried (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        // undici socket-shape: cause has .name but no .code. The previous
+        // classifier skipped past it (no .code), giving up on a retriable
+        // socket blip.
+        const cause = Object.assign(new Error('socket hang up'), { name: 'SocketError' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-name-only' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-name-only/);
+      assert.equal(calls, 2, 'should have retried once after name-only cause');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: persistent opaque "fetch failed" surfaces cause message in the error (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    global.fetch = async () => {
+      // undici-22+ plain-Error wrapper, no .code anywhere. We still want
+      // the operator to see *something* more informative than a bare
+      // "fetch failed" — surface the cause's message if available.
+      const cause = new Error('TLS handshake timeout after 30s');
+      throw Object.assign(new Error('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /TLS handshake timeout/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)),
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: persistent bare "fetch failed" with no cause still surfaces retriable status (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      // Worst case: wrapper only, no cause, no code, no name. The wrapper
+      // ITSELF is the diagnostic. We retry per the new classifier and on
+      // exhaustion surface the wrapper message verbatim (the operator
+      // should know undici said "fetch failed").
+      throw new TypeError('fetch failed');
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /fetch failed/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)),
+      );
+      // 4 attempts for deep-research (attempts=4) — confirms we DID retry
+      // instead of giving up after the first opaque failure.
+      assert.equal(calls, 4, 'opaque fetch failed should still be retried 3 times');
+    } finally {
+      restore();
+    }
+  });
+});
