@@ -6,16 +6,23 @@
 //   1. Direct URL: a literal URL in the prompt → POST /v1/scrape and reply
 //      with title + first chunk of markdown (INFA-22, kept for backward-compat).
 //
-//   2. Free-form pick-one (INFA-22 delegation): no URL in the prompt → ask the
-//      local Qwen CLI to pick a single URL → POST /v1/scrape.
+//   2. Free-form pick-one (INFA-22 delegation): no URL in the prompt and the
+//      prompt is NOT an open research question → ask the local Qwen CLI to
+//      pick a single URL → POST /v1/scrape. If Qwen returns no pick and the
+//      prompt doesn't look like an explicit fetch command, we transparently
+//      fall through to the research pipeline (Path 3) so the user gets an
+//      answer instead of a dead-end.
 //
-//   3. Recursive research (INFA-23): no URL in the prompt AND the question
-//      looks like an open research question (i.e. the user wants an answer,
-//      not a single page). Pipeline:
+//   3. Recursive research (INFA-23): no URL in the prompt AND the prompt
+//      looks like an open research question. Pipeline:
 //
 //        a. ask Qwen to derive a Google-style search query from the prompt;
+//           on failure, derive a noun-phrase fallback straight from the
+//           user prompt (strips common question prefixes);
 //        b. POST Firecrawl /v2/search with `sources: ["web"]` and a small
 //           `limit` (default 5) to retrieve result URLs with title/snippet;
+//           if zero results come back, retry once with the derived fallback
+//           query before giving up;
 //        c. ask Qwen to rank the results and pick the top K (default 3);
 //        d. POST Firecrawl /v1/scrape for each chosen URL, accumulating
 //           markdown up to a hard cap (FIRECRAWL_RECURSE_MAX_CHARS, default
@@ -28,6 +35,19 @@
 //      friendly message on failure. We do NOT silently swallow errors: if any
 //      step fails we return what we have plus a hint, or — when nothing is
 //      available — fall back to the single-pick path.
+//
+// Heuristic for "research question" (`looksLikeResearchQuestion`):
+//   - The prompt contains a question mark, OR starts with a question word,
+//   - OR contains an imperative research trigger ("tell me about",
+//     "explain", "compare", "list" …),
+//   - OR contains a comparative / superlative phrase ("best", "cheapest",
+//     "günstigste", "recommended" …) — the INFA-23 reopened prompt
+//     "cheapest allnet flat" lands here even without "what is …",
+//   - OR starts with an info-seeking verb ("find …", "empfehl mir …"),
+//   - OR is >= RESEARCH_LENGTH_THRESHOLD chars.
+//
+//   Explicit fetch imperatives ("scrape …", "fetch …", "show me …") never
+//   escalate — those users want a single page, not a research dump.
 //
 // Stub fallback (INFA-20): if FIRECRAWL_API_KEY is missing we still return a
 // friendly hint instead of throwing AuthError so the group never goes silently
@@ -55,9 +75,20 @@ const SCRAPE_PATH = '/v1/scrape';
 // trigger (e.g. "tell me about", "explain", "list", "compare") OR is longer
 // than the threshold, treat it as a research question (path 3) rather than
 // a direct fetch request (path 2).
+//
+// Also catch the common short-form phrasing where the user asks for info
+// without a question mark: "cheapest allnet flat", "best pizza in berlin",
+// "iphone 15 review". These are open research requests, not direct fetches.
 const QUESTION_HINT_RE = /\?|^(was|wie|wer|wo|wann|warum|wieso|weshalb|wem|wen|wessen|which|what|who|where|when|why|how|erkläre|erklär|beschreib|nenn|lis|vergleich|zeig|unterschied|unterschiede)\b/i;
 // Imperative research triggers — these ALWAYS escalate regardless of length.
 const RESEARCH_TRIGGER_RE = /\b(tell me about|explain|describe|list|compare|give me|provide|was sind|wie ist|was macht|wie funktioniert|unterschied zwischen|unterschiede zwischen|overview|summary|summarize)\b/i;
+// Comparative / superlative phrases — strong signal that the user wants an
+// answer ("what is the best/cheapest/fastest …"), not a single page fetch.
+const COMPARATIVE_RE = /\b(best|beste[nsr]?|besten|cheapest|günstigste[nsr]?|günstigsten|billigste[nsr]?|billigsten|fastest|schnellste[nsr]?|top|worst|schlechteste[nsr]?|teuerste[nsr]?|teuersten|latest|neueste[nsr]?|neuesten|newest|new|recommended|empfohlene[nsr]?|empfohlenen|popular|beliebte[nsr]?|beliebten|review|reviews|test|vergleich|comparison|alternative|alternatives)\b/i;
+// Generic info-seeking verbs in imperative form ("find …", "search …",
+// "look up …"). Without a noun phrase after them, the user wants an answer
+// sourced from multiple pages.
+const SEEK_VERB_RE = /^(find|suche|such|search|look up|nenn mir|nenne|gib mir|empfehl|empfehle|zeig mir|recommend|suggest|vorschlag|schlag .* vor)\b/i;
 const RESEARCH_LENGTH_THRESHOLD = 60;
 
 function clampInt(value, fallback, min, max) {
@@ -76,15 +107,17 @@ function extractUrl(prompt) {
 function looksLikeResearchQuestion(prompt) {
   const trimmed = String(prompt || '').trim();
   if (!trimmed) return false;
+  // The classic "scrape …" / "fetch …" prefix means the user wants a
+  // specific page; do NOT escalate to research mode even if other triggers
+  // match below.
+  if (/^(scrape|fetch|lade|hole|zeig|show|get|load|open|öffne)\b/i.test(trimmed)) return false;
   if (
     QUESTION_HINT_RE.test(trimmed) ||
     RESEARCH_TRIGGER_RE.test(trimmed) ||
+    COMPARATIVE_RE.test(trimmed) ||
+    SEEK_VERB_RE.test(trimmed) ||
     trimmed.length >= RESEARCH_LENGTH_THRESHOLD
   ) {
-    // The classic "scrape …" / "fetch …" prefix means the user wants a
-    // specific page; do NOT escalate to research mode even if the trigger
-    // regex matches.
-    if (/^(scrape|fetch|lade|hole|zeig|show|get)\b/i.test(trimmed)) return false;
     return true;
   }
   return false;
@@ -308,6 +341,21 @@ async function formulateQueryWithQwen(prompt, ctx) {
   return parsed.query;
 }
 
+// Strip common question prefixes so a question sentence becomes a noun
+// phrase that web search can index. Used as a fallback when Qwen query
+// formulation fails or the first search returns nothing.
+const QUESTION_PREFIX_RE = /^(what is|what are|who is|who are|where is|where are|when is|when are|why is|why are|how is|how are|how do|how does|how can|how to|tell me about|was ist|was sind|wer ist|wer sind|wo ist|wo sind|wann ist|wann sind|warum ist|warum sind|wie ist|wie sind|wie kann|wie geht|gib mir|nenn mir|empfehl mir|ich suche|ich brauche)\b/i;
+function deriveFallbackQuery(prompt) {
+  let q = String(prompt || '').trim();
+  if (!q) return null;
+  q = q.replace(/[?.!]+$/, '').trim();
+  q = q.replace(QUESTION_PREFIX_RE, '').trim();
+  if (q.length < 3) return null;
+  // Keep the noun phrase short — Google rewards 3–8 words.
+  const words = q.split(/\s+/).slice(0, 8).join(' ');
+  return words || null;
+}
+
 async function rankResultsWithQwen(prompt, results, ctx) {
   if (results.length === 0) return { picks: [], reason: 'no_results' };
   const planningPrompt = buildRankingPrompt(prompt, results.slice(0, SEARCH_LIMIT));
@@ -399,41 +447,69 @@ function normaliseSearchResults(json) {
 
 async function runResearch(prompt, ctx, env) {
   // Step 1: formulate a search query.
-  let query;
+  let primaryQuery;
   try {
-    query = await formulateQueryWithQwen(prompt, ctx);
+    primaryQuery = await formulateQueryWithQwen(prompt, ctx);
   } catch (err) {
-    return (
-      'Firecrawl-Recherche braucht ein laufendes Qwen-CLI, um eine Suchanfrage ' +
-      'aus deiner Frage abzuleiten.\n\n' +
-      `Fehler bei der Suchanfrage-Planung: ${err && err.message ? err.message : String(err)}`
-    );
+    // Fallback: derive a query straight from the user prompt. We strip
+    // common question prefixes ("what is", "wie ist", "wer ist"…) so the
+    // search gets a noun phrase rather than a question sentence.
+    primaryQuery = deriveFallbackQuery(prompt);
+    if (!primaryQuery) {
+      return (
+        'Firecrawl-Recherche braucht ein laufendes Qwen-CLI, um eine Suchanfrage ' +
+        'aus deiner Frage abzuleiten.\n\n' +
+        `Fehler bei der Suchanfrage-Planung: ${err && err.message ? err.message : String(err)}`
+      );
+    }
   }
 
-  // Step 2: search via Firecrawl /v2/search.
-  let searchJson;
-  try {
-    searchJson = await callFirecrawlSearch({
-      apiKey: env.apiKey,
-      baseUrl: env.baseUrl,
-      query,
-      requestId: env.requestId,
-      limit: SEARCH_LIMIT,
-    });
-  } catch (err) {
-    const reason = err && err.message ? err.message : String(err);
-    return (
-      `Firecrawl-Suche nach \`${query}\` fehlgeschlagen.\n\n` +
-      `Fehler: ${reason}\n\n` +
-      `Tipp: schick eine konkrete URL, z.B. \`scrape https://example.com\`.`
-    );
+  // Step 2: search via Firecrawl /v2/search. If the formulated query
+  // returns no hits we retry once with a simpler, prefix-stripped variant
+  // before giving up.
+  const queries = [primaryQuery, deriveFallbackQuery(prompt)].filter(Boolean);
+  const seenQueries = new Set();
+  let results = [];
+  let lastQuery = primaryQuery;
+  let searchError = null;
+  for (const q of queries) {
+    if (!q || seenQueries.has(q)) continue;
+    seenQueries.add(q);
+    lastQuery = q;
+    let searchJson;
+    try {
+      searchJson = await callFirecrawlSearch({
+        apiKey: env.apiKey,
+        baseUrl: env.baseUrl,
+        query: q,
+        requestId: env.requestId,
+        limit: SEARCH_LIMIT,
+      });
+    } catch (err) {
+      const reason = err && err.message ? err.message : String(err);
+      // If this is the first query, surface a friendly message and bail.
+      // If it's the fallback, fall through to the empty-results message
+      // (search works, just nothing to find).
+      if (seenQueries.size === 1) {
+        return (
+          `Firecrawl-Suche nach \`${q}\` fehlgeschlagen.\n\n` +
+          `Fehler: ${reason}\n\n` +
+          `Tipp: schick eine konkrete URL, z.B. \`scrape https://example.com\`.`
+        );
+      }
+      searchError = reason;
+      continue;
+    }
+    results = normaliseSearchResults(searchJson);
+    if (results.length > 0) break;
   }
 
-  const results = normaliseSearchResults(searchJson);
   if (results.length === 0) {
+    const tail = searchError
+      ? `\n\nLetzter Suchfehler: ${searchError}`
+      : '\n\nTipp: formuliere die Frage konkreter oder schick eine URL.';
     return (
-      `Firecrawl-Suche nach \`${query}\` hat keine Treffer geliefert.\n\n` +
-      `Tipp: formuliere die Frage konkreter oder schick eine URL.`
+      `Firecrawl-Suche nach \`${lastQuery}\` hat keine Treffer geliefert.${tail}`
     );
   }
 
@@ -446,7 +522,7 @@ async function runResearch(prompt, ctx, env) {
     // but if Qwen itself is broken we surface a clear message.
     const reason = err && err.message ? err.message : String(err);
     return (
-      `Firecrawl hat ${results.length} Treffer für \`${query}\` gefunden, aber Qwen ` +
+      `Firecrawl hat ${results.length} Treffer für \`${lastQuery}\` gefunden, aber Qwen ` +
       `konnte sie nicht bewerten.\n\n` +
       `Fehler: ${reason}\n\n` +
       `Erste Treffer zum Anschauen:\n` +
@@ -456,7 +532,7 @@ async function runResearch(prompt, ctx, env) {
 
   if (!ranked.picks || ranked.picks.length === 0) {
     return (
-      `Firecrawl hat ${results.length} Treffer für \`${query}\` gefunden, aber Qwen ` +
+      `Firecrawl hat ${results.length} Treffer für \`${lastQuery}\` gefunden, aber Qwen ` +
       `hält keinen davon für relevant.\n\n` +
       `Grund: ${ranked.reason || '(keine Begründung)'}\n\n` +
       `Erste Treffer zum Anschauen:\n` +
@@ -556,6 +632,19 @@ async function run(prompt, ctx = {}) {
   try {
     const pick = await planUrlWithQwen(prompt, ctx);
     if (!pick.url) {
+      // If the prompt LOOKS like a research question (heuristic already
+      // escalated it past Path 2 in normal flow, but Path 2 still runs for
+      // short imperatives), fall back to the recursive pipeline so the user
+      // gets an answer instead of a dead end. We only do this when the
+      // prompt is NOT an explicit fetch command ("scrape …" etc.) — those
+      // users want a single page, not a research dump.
+      if (!/^(scrape|fetch|lade|hole|zeig|show|get|load|open|öffne)\b/i.test(prompt)) {
+        const researchReply = await runResearch(prompt, ctx, env);
+        const breadcrumb =
+          `_(Hinweis: Qwen konnte keine einzelne URL ableiten — habe stattdessen ` +
+          `die Recherche-Pipeline benutzt.)_\n\n`;
+        return breadcrumb + researchReply;
+      }
       return (
         `Qwen konnte zu deiner Anfrage keine passende URL finden.\n\n` +
         `Grund: ${pick.reason || '(keine Begründung)'}\n\n` +
