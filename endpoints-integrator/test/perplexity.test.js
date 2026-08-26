@@ -194,3 +194,71 @@ test('perplexity: deep-research model uses same endpoint', async () => {
     }
   });
 });
+
+test('perplexity: undici TypeError("fetch failed") is retried then succeeds (INFA-24)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const restore = fakeFetch({
+      [URL]: () => {
+        calls += 1;
+        if (calls < 2) {
+          // Mimic undici's transport-level failure: a TypeError whose
+          // .message is "fetch failed" and whose .cause carries the
+          // undici code (UND_ERR_SOCKET, UND_ERR_CONNECT_TIMEOUT, etc).
+          const e = new TypeError('fetch failed');
+          e.cause = Object.assign(new Error('socket hang up'), { code: 'UND_ERR_SOCKET' });
+          throw e;
+        }
+        return okJson({ choices: [{ message: { content: 'recovered' } }] });
+      },
+    });
+    try {
+      const text = await real.run('hi', { model: 'sonar-reasoning-pro' });
+      assert.equal(text, 'recovered');
+      assert.equal(calls, 2, 'must retry at least once on fetch-failed TypeError');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: bare fetch-failed TypeError (no cause) is also retried (INFA-24)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const restore = fakeFetch({
+      [URL]: () => {
+        calls += 1;
+        if (calls < 3) throw new TypeError('fetch failed');
+        return okJson({ choices: [{ message: { content: 'finally-ok' } }] });
+      },
+    });
+    try {
+      const text = await real.run('hi', { model: 'sonar-reasoning-pro' });
+      assert.equal(text, 'finally-ok');
+      assert.equal(calls, 3, 'must retry through all attempts on persistent fetch-failed');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research fetch-failed exhaustion surfaces cause code (INFA-24)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const restore = fakeFetch({
+      [URL]: () => {
+        const e = new TypeError('fetch failed');
+        e.cause = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+        throw e;
+      },
+    });
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /all retries exhausted.*UND_ERR_SOCKET/s.test(String(err.message)),
+        'final DispatcherError should include the undici cause code',
+      );
+    } finally {
+      restore();
+    }
+  });
+});

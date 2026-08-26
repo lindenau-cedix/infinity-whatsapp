@@ -79,6 +79,21 @@ async function runWithRetry(fn, opts = {}) {
     if (err && (err.name === 'AbortError' || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET')) {
       return true;
     }
+    // undici surfaces transport-level errors as `TypeError: fetch failed`
+    // with a `.cause` that may carry a `.code` like "UND_ERR_SOCKET",
+    // "UND_ERR_CONNECT_TIMEOUT", "ECONNRESET", "ECONNREFUSED", etc. The
+    // current classifier can't see those because the wrapping TypeError
+    // exposes neither a name we recognise nor a node-style .code — so
+    // socket resets and idle-pool drops fall through as "non-retriable"
+    // and surface as a confusing "all retries exhausted: fetch failed"
+    // after the FIRST AbortError already burned one retry (INFA-24).
+    if (err && err.name === 'TypeError' && /fetch failed/i.test(err.message || '')) {
+      const cause = err.cause;
+      if (cause && cause !== err) return true;
+      // Some undici versions put the diagnostic only on .message — treat
+      // a bare "fetch failed" TypeError with no Response as retriable.
+      return true;
+    }
     return false;
   };
 
@@ -102,7 +117,14 @@ async function runWithRetry(fn, opts = {}) {
       clearTimeout(timer);
     }
   }
-  throw new DispatcherError(adapter, 'all retries exhausted', lastErr);
+  // Surface the underlying transport signal in the final wrapper so the
+  // WhatsApp client logs and the operator can tell socket RST / timeout /
+  // DNS apart from a real 5xx. (INFA-24: "fetch failed" was hiding the
+  // undici cause code.)
+  const cause = lastErr?.cause;
+  const causeCode = cause?.code || cause?.name || '';
+  const detail = causeCode ? `: ${causeCode}` : '';
+  throw new DispatcherError(adapter, `all retries exhausted${detail}`, lastErr);
 }
 
 function trimForReply(text, maxChars = 3500) {
