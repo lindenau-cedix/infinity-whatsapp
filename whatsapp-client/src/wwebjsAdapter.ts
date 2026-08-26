@@ -189,6 +189,17 @@ export class WWebJsAdapter implements WhatsAppAdapter {
       this.reconnectAttempts = 0;
       this.log.info("wa.ready");
       this.emit({ kind: "ready" });
+      // Once the session is ready, validate that the four JIDs in .env
+      // actually correspond to groups the WA account is a member of. INFA-20
+      // was a silent routing hole when one of those JIDs was mistyped — the
+      // operator saw only Qwen messages flow and had no signal pointing at
+      // the wrong env var. We list the joined groups and emit a single
+      // warning per misconfigured endpoint so the cause is obvious.
+      this.validateConfiguredJids().catch((err) => {
+        this.log.warn("wa.jid_validation_failed", {
+          error: errorMsg(err),
+        });
+      });
     });
 
     this.client.on("disconnected", (reason: string) => {
@@ -220,6 +231,67 @@ export class WWebJsAdapter implements WhatsAppAdapter {
     }, delay).unref();
   }
 
+  /**
+   * After the WA session reports ready, list the joined groups and compare
+   * them against the four JIDs the operator set in .env. A misconfigured
+   * JID silently turns a group into a black hole (route() drops the
+   * message because findGroupByJid can't match it), which is exactly the
+   * "only Qwen group works" symptom that opened INFA-20. We log one
+   * warning per endpoint that is missing from the joined list and a
+   * single info-level summary of how many matched, so the operator can
+   * see at a glance which env var to fix.
+   */
+  private async validateConfiguredJids(): Promise<void> {
+    // whatsapp-web.js exposes the chats list; groups are chats whose
+    // id._serialized ends with '@g.us'. We pull id, name, and subject so
+    // the warning text is operator-readable, not just opaque JIDs.
+    type GroupChat = { id: { _serialized: string }; name?: string; subject?: string };
+    const chats = (await (this.client as unknown as {
+      getChats: () => Promise<unknown[]>;
+    }).getChats()) as GroupChat[];
+    const joined = new Map<string, GroupChat>();
+    for (const c of chats) {
+      const id = c?.id?._serialized;
+      if (typeof id === "string" && id.endsWith("@g.us")) {
+        joined.set(id, c);
+      }
+    }
+
+    const matched: string[] = [];
+    const missing: { endpoint: string; jid: string }[] = [];
+    for (const cfg of Object.values(this.groups)) {
+      if (joined.has(cfg.jid)) {
+        matched.push(cfg.jid);
+      } else {
+        missing.push({ endpoint: cfg.endpoint, jid: cfg.jid });
+      }
+    }
+
+    if (missing.length === 0) {
+      this.log.info("wa.jid_validation.ok", {
+        matchedCount: matched.length,
+        joinedCount: joined.size,
+      });
+      return;
+    }
+
+    // Build a small list of joined JIDs the operator can eyeball against
+    // the .env. We cap at 20 to keep the log line readable; most users
+    // have far fewer than that.
+    const joinedSample = [...joined.keys()].slice(0, 20);
+    this.log.warn("wa.jid_validation.mismatch", {
+      missing,
+      joinedCount: joined.size,
+      joinedSample,
+      hint:
+        "A configured WA_GROUP_JID_* does not correspond to any group the " +
+        "WA account is a member of. Messages from that chat will be " +
+        "ignored at the router. Run `infinity-whatsapp --check-groups` " +
+        "to see the configured JIDs; pull the real JID from WhatsApp " +
+        "(group info → invite link) and update .env.",
+    });
+  }
+
   private attachMessageStream(): void {
     this.client.on("message", (raw: unknown) => {
       const msg = raw as WWebJsMessage;
@@ -239,7 +311,19 @@ export class WWebJsAdapter implements WhatsAppAdapter {
     const chatJid = msg.from;
     const group = findGroupByJid(chatJid, this.groups);
     if (!group) {
-      // Not one of the four configured groups — silently ignore.
+      // Not one of the four configured groups. Previously this returned
+      // silently, which made INFA-20's "only Qwen group works" symptom look
+      // like a routing black hole — operators saw no log line at all and
+      // could not distinguish a JID typo from a wiring bug. Emit a single
+      // info-level line so the dropped message is visible, and include the
+      // list of configured JIDs as a hint that they probably need to
+      // double-check their .env. INFA-20.
+      this.log.info("wa.message.ignored_no_group", {
+        from: chatJid,
+        author: msg.author,
+        configuredJids: Object.values(this.groups).map((g) => g.jid),
+        bodyBytes: (msg.body ?? "").length,
+      });
       return;
     }
 
