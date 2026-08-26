@@ -196,8 +196,16 @@ export class WWebJsAdapter implements WhatsAppAdapter {
       // the wrong env var. We list the joined groups and emit a single
       // warning per misconfigured endpoint so the cause is obvious.
       this.validateConfiguredJids().catch((err) => {
+        // Surface more than just `message`: a non-Error throw (e.g. whatsapp-
+        // web.js rejecting with a bare string like `"r"`) used to log
+        // `error: "r"` and leave the operator guessing. INFA-20 follow-up.
         this.log.warn("wa.jid_validation_failed", {
           error: errorMsg(err),
+          errorName: err instanceof Error ? err.name : typeof err,
+          errorCode:
+            err && typeof err === "object" && "code" in err
+              ? String((err as { code?: unknown }).code ?? "")
+              : "",
         });
       });
     });
