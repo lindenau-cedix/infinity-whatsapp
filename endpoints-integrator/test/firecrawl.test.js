@@ -274,13 +274,16 @@ test('firecrawl: normaliseSearchResults handles web array and flat array shapes'
   assert.deepEqual(real.normaliseSearchResults({}), []);
 });
 
-test('firecrawl: research — Qwen query → /v2/search → Qwen rank → scrape → Qwen compose', async () => {
-  // Three Qwen invocations: query-formulation, ranking, composition.
+test('firecrawl: research — Qwen query → /v2/search → Qwen rank → scrape → Qwen refine → scrape → Qwen compose', async () => {
+  // Four Qwen invocations: query-formulation, ranking, refinement (round 2),
+  // composition. The refinement reply proposes one new URL the round-1 picks
+  // didn't cover; the pipeline then scrapes it before composing.
   const qwen = await fakeQwenCli({
     replies: [
       '{"query":"tcp udp unterschied"}',
       '{"picks":[{"url":"https://a.test","reason":"offiziell"},{"url":"https://b.test","reason":"vergleich"}]}',
-      '## Kurze Antwort\nTCP verbindungsorientiert, UDP nicht.\n\n*Quellen*\n- A — https://a.test\n- B — https://b.test',
+      '{"picks":[{"url":"https://c.test","reason":"wikipedia","gap":"Definition"}]}',
+      '## Kurze Antwort\nTCP verbindungsorientiert, UDP nicht.\n\n*Quellen*\n- A — https://a.test\n- B — https://b.test\n- C — https://c.test',
     ],
   });
   try {
@@ -316,8 +319,9 @@ test('firecrawl: research — Qwen query → /v2/search → Qwen rank → scrape
           assert.equal(searchBody.query, 'tcp udp unterschied');
           assert.deepEqual(searchBody.sources, ['web']);
           assert.equal(searchBody.limit, 5);
-          // Only the ranked URLs got scraped (no C).
-          assert.deepEqual(scrapeUrls, ['https://a.test', 'https://b.test']);
+          // Round-1 ranked URLs got scraped first, then the round-2 refinement
+          // URL — proves the recursion step ran.
+          assert.deepEqual(scrapeUrls, ['https://a.test', 'https://b.test', 'https://c.test']);
           // Final reply is the Qwen-composed answer, not a raw dump.
           assert.match(text, /## Kurze Antwort/);
           assert.match(text, /Quellen/);
@@ -416,6 +420,7 @@ test('firecrawl: research — partial scrape failure keeps the rest and cites th
     replies: [
       '{"query":"q"}',
       '{"picks":[{"url":"https://ok.test","reason":"good"},{"url":"https://bad.test","reason":"also"}]}',
+      '{"picks":[],"reason":"runde 1 reicht"}',
       'fallback body',
     ],
   });
@@ -453,6 +458,7 @@ test('firecrawl: research — honours FIRECRAWL_RECURSE_MAX_CHARS env override',
     replies: [
       '{"query":"q"}',
       '{"picks":[{"url":"https://a.test","reason":"r"}]}',
+      '{"picks":[],"reason":"runde 1 reicht"}',
       'final',
     ],
   });
@@ -480,12 +486,15 @@ test('firecrawl: research — honours FIRECRAWL_RECURSE_MAX_CHARS env override',
 test('firecrawl: research — retries with a derived query when the formulated query returns nothing', async () => {
   // Qwen formulates a query that gets 0 hits; the pipeline should retry with
   // the prefix-stripped fallback ("allnet flat" instead of "what is the
-  // cheapest allnet flat") and succeed on the second try.
+  // cheapest allnet flat") and succeed on the second try. The refinement
+  // step is intentionally a no-op here (empty picks) so round 2 doesn't
+  // scrape anything extra.
   const searchQueries = [];
   const qwen = await fakeQwenCli({
     replies: [
       '{"query":"what is the cheapest allnet flat"}',
       '{"picks":[{"url":"https://a.test","reason":"r"}]}',
+      '{"picks":[],"reason":"runde 1 reicht"}',
       'final composed answer',
     ],
   });
@@ -520,12 +529,15 @@ test('firecrawl: research — Path-2 Qwen url:null falls back to the recursive p
   // Path 2 picks up first) and Qwen then says "I can't pick a URL", the
   // adapter now falls through to the research pipeline instead of leaving
   // the user with a dead-end message. The breadcrumb makes the fallback
-  // visible so the user can tell what changed.
+  // visible so the user can tell what changed. Five Qwen invocations:
+  // Path-2 pick (returns null), query-formulation, ranking, refinement
+  // (round 2 — empty so the test stays focused), composition.
   const qwen = await fakeQwenCli({
     replies: [
       '{"url":null,"reason":"keine passende offizielle Quelle"}',
       '{"query":"pizza berlin"}',
       '{"picks":[{"url":"https://p.test","reason":"r"}]}',
+      '{"picks":[],"reason":"runde 1 reicht"}',
       'composed answer',
     ],
   });
@@ -548,4 +560,107 @@ test('firecrawl: research — Path-2 Qwen url:null falls back to the recursive p
   } finally {
     await qwen.cleanup();
   }
+});
+
+test('firecrawl: research — round 2 skips URLs Qwen already proposed in round 1 (no double-scrape)', async () => {
+  // The refinement prompt explicitly tells Qwen not to repeat a URL we've
+  // already scraped. Even if Qwen tries to send it anyway, the adapter
+  // dedupes on normalized URL.
+  const qwen = await fakeQwenCli({
+    replies: [
+      '{"query":"q"}',
+      '{"picks":[{"url":"https://a.test","reason":"good"},{"url":"https://b.test/","reason":"other"}]}',
+      // Round-2 picks capped at RECURSE_TOP_K=2. Order matters: Qwen sends
+      // the new URL first so it survives the cap, then two duplicates of an
+      // already-scraped URL — the adapter must drop both.
+      '{"picks":[{"url":"https://c.test","reason":"new"},{"url":"https://a.test","reason":"dup"},{"url":"https://a.test/","reason":"dup2"}]}',
+      'final',
+    ],
+  });
+  try {
+    await withEnv({ FIRECRAWL_API_KEY: 'fc-test', QWEN_BIN: qwen.binPath }, async () => {
+      const scrapeUrls = [];
+      const restore = fakeFetch({
+        [SEARCH_URL]: () => okJson({ data: { web: [
+          { title: 'A', url: 'https://a.test', description: '' },
+          { title: 'B', url: 'https://b.test/', description: '' },
+        ] } }),
+        [URL]: (init) => {
+          scrapeUrls.push(JSON.parse(init.body).url);
+          return okJson({ data: { markdown: 'body', metadata: { title: 'P' } } });
+        },
+      });
+      try {
+        await real.run('Was sind die wichtigsten Eigenschaften von TCP?', { requestId: 'r-dedupe' });
+        // Round 1: A, B. Round 2 should only add C — never re-scrape A or B.
+        assert.deepEqual(scrapeUrls, ['https://a.test', 'https://b.test/', 'https://c.test']);
+      } finally {
+        restore();
+      }
+    });
+  } finally {
+    await qwen.cleanup();
+  }
+});
+
+test('firecrawl: research — FIRECRAWL_RECURSE_MAX_DEPTH=0 disables the round-2 leg', async () => {
+  // Operators on tight Firecrawl quotas can disable the recursion entirely.
+  // With depth=0 we expect exactly three Qwen invocations: query-formulation,
+  // ranking, composition — no refinement call.
+  //
+  // The recursion-depth constant is read at module load, so we have to
+  // require a fresh copy of the adapter after setting the env override.
+  const qwen = await fakeQwenCli({
+    replies: [
+      '{"query":"q"}',
+      '{"picks":[{"url":"https://a.test","reason":"r"}]}',
+      'final composed',
+    ],
+  });
+  try {
+    await withEnv(
+      { FIRECRAWL_API_KEY: 'fc-test', QWEN_BIN: qwen.binPath, FIRECRAWL_RECURSE_MAX_DEPTH: '0' },
+      async () => {
+        // Wipe the cached module so it re-reads the env override.
+        const modPath = require.resolve('../dispatcher/firecrawl.js');
+        delete require.cache[modPath];
+        const fresh = require('../dispatcher/firecrawl.js');
+        assert.equal(fresh.RECURSE_MAX_DEPTH, 0, 'env override should have lowered depth to 0');
+        const scrapeUrls = [];
+        const restore = fakeFetch({
+          [SEARCH_URL]: () => okJson({ data: { web: [{ title: 'A', url: 'https://a.test', description: '' }] } }),
+          [URL]: (init) => {
+            scrapeUrls.push(JSON.parse(init.body).url);
+            return okJson({ data: { markdown: 'A page', metadata: { title: 'A' } } });
+          },
+        });
+        try {
+          const text = await fresh.run('Was sind die wichtigsten Eigenschaften von TCP?', { requestId: 'r-nodept' });
+          assert.match(text, /final composed/);
+          // Only the round-1 URL got scraped; round 2 is fully off.
+          assert.deepEqual(scrapeUrls, ['https://a.test']);
+        } finally {
+          restore();
+        }
+      },
+    );
+  } finally {
+    await qwen.cleanup();
+  }
+});
+
+test('firecrawl: parseQwenRefinePicks filters invalid URLs and caps at RECURSE_TOP_K', () => {
+  assert.deepEqual(
+    real.parseQwenRefinePicks('{"picks":[{"url":"https://x.test","reason":"r1","gap":"g1"},{"url":"ftp://bad","reason":"x"},{"url":"https://y.test"}]}'),
+    { picks: [{ url: 'https://x.test', reason: 'r1', gap: 'g1' }, { url: 'https://y.test', reason: null, gap: null }], reason: null },
+  );
+  assert.deepEqual(real.parseQwenRefinePicks('{"picks":[],"reason":"nope"}'), { picks: [], reason: 'nope' });
+  assert.equal(real.parseQwenRefinePicks('not json'), null);
+});
+
+test('firecrawl: normalizeUrl lowercases and strips trailing slashes', () => {
+  assert.equal(real.normalizeUrl('https://Example.com/'), 'https://example.com');
+  assert.equal(real.normalizeUrl('http://x.test/path/'), 'http://x.test/path');
+  assert.equal(real.normalizeUrl('ftp://nope'), null);
+  assert.equal(real.normalizeUrl(null), null);
 });

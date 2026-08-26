@@ -13,28 +13,42 @@
 //      fall through to the research pipeline (Path 3) so the user gets an
 //      answer instead of a dead-end.
 //
-//   3. Recursive research (INFA-23): no URL in the prompt AND the prompt
-//      looks like an open research question. Pipeline:
+//   3. Recursive research (INFA-23, second-pass): no URL in the prompt AND
+//      the prompt looks like an open research question. The pipeline is
+//      explicitly two scrape rounds deep — that's what the user asked for
+//      when they reopened INFA-23:
 //
-//        a. ask Qwen to derive a Google-style search query from the prompt;
-//           on failure, derive a noun-phrase fallback straight from the
-//           user prompt (strips common question prefixes);
-//        b. POST Firecrawl /v2/search with `sources: ["web"]` and a small
-//           `limit` (default 5) to retrieve result URLs with title/snippet;
-//           if zero results come back, retry once with the derived fallback
-//           query before giving up;
-//        c. ask Qwen to rank the results and pick the top K (default 3);
-//        d. POST Firecrawl /v1/scrape for each chosen URL, accumulating
-//           markdown up to a hard cap (FIRECRAWL_RECURSE_MAX_CHARS, default
-//           12_000) so the final Qwen composition step stays within its
-//           CLI argv budget;
-//        e. ask Qwen to compose a pretty formatted German answer from the
-//           accumulated material, citing each source by title + URL.
+//        Round 1 — seed:
+//          a. ask Qwen to derive 1-3 Google-style search queries from the
+//             prompt; on failure, derive noun-phrase fallbacks straight from
+//             the user prompt (strips common question prefixes);
+//          b. POST Firecrawl /v2/search with `sources: ["web"]` and a small
+//             `limit` (default 5) to retrieve result URLs with title/snippet;
+//             retry the derived fallback if zero hits come back;
+//          c. ask Qwen to rank the results and pick the top K (default 3);
+//          d. POST Firecrawl /v1/scrape for each chosen URL.
+//
+//        Round 2 — recurse (the new step):
+//          e. feed Qwen the first-round markdown and the user prompt; ask it
+//             to either (i) propose NEW URLs that look authoritative /
+//             complementary (links it inferred from the scraped content,
+//             references, or known authoritative domains), or (ii) say
+//             "enough" if the first round already covers the answer;
+//          f. POST Firecrawl /v1/scrape for each accepted new URL;
+//          g. accumulate everything up to FIRECRAWL_RECURSE_MAX_CHARS (default
+//             12_000) so the final Qwen composition step stays within its
+//             CLI argv budget;
+//          h. ask Qwen to compose a pretty formatted German answer, citing
+//             every source by title + URL.
 //
 //      Every step has its own bounded timeout and surfaces a clear operator-
 //      friendly message on failure. We do NOT silently swallow errors: if any
 //      step fails we return what we have plus a hint, or — when nothing is
 //      available — fall back to the single-pick path.
+//
+//      The recursion depth is bounded by FIRECRAWL_RECURSE_MAX_DEPTH
+//      (default 1 = one extra scrape round on top of round 1). Set to 0 to
+//      disable round 2 entirely (single-scrape mode, useful for tight quotas).
 //
 // Heuristic for "research question" (`looksLikeResearchQuestion`):
 //   - The prompt contains a question mark, OR starts with a question word,
@@ -66,6 +80,13 @@ const MAX_PROMPT_CHARS = 4_000;
 // --- INFA-23 tunables (env-overridable) -------------------------------------
 const SEARCH_LIMIT = clampInt(process.env.FIRECRAWL_SEARCH_LIMIT, 5, 1, 10);
 const PICK_TOP_K = clampInt(process.env.FIRECRAWL_PICK_TOP_K, 3, 1, 5);
+// How many new URLs Qwen may pick in the second scrape round (the recursion
+// step). Capped separately from PICK_TOP_K because round-2 URLs come from
+// Qwen's own knowledge of authoritative sources, not from a fresh search.
+const RECURSE_TOP_K = clampInt(process.env.FIRECRAWL_RECURSE_TOP_K, 2, 1, 5);
+// How many recursion rounds to run after round 1. Default = 1 (i.e. round 1
+// + one round 2). Set to 0 to disable round 2 entirely.
+const RECURSE_MAX_DEPTH = clampInt(process.env.FIRECRAWL_RECURSE_MAX_DEPTH, 1, 0, 3);
 const MAX_TOTAL_CHARS = clampInt(process.env.FIRECRAWL_RECURSE_MAX_CHARS, 12_000, 2_000, 40_000);
 const SEARCH_TIMEOUT_MS = 30_000;
 const SCRAPE_TIMEOUT_MS = 45_000;
@@ -226,6 +247,48 @@ function buildRankingPrompt(userPrompt, results) {
   return lines.join('\n');
 }
 
+function buildRefinePrompt(userPrompt, sources) {
+  // Round-2 Qwen prompt: given the first-round scraped content, either propose
+  // NEW authoritative URLs to scrape next, or say "enough" if the material
+  // already covers the user's question. This is the recursion leg — the new
+  // URLs come from Qwen's knowledge of authoritative sources for the topic
+  // (e.g. known Wikipedia entries, official docs, comparison sites) inferred
+  // from what the first-round pages actually discussed.
+  const lines = [
+    'Du bist ein Recherche-Verfeinerer. Du bekommst die Nutzerfrage und die',
+    'bereits gescrapten Quellenauszüge aus Runde 1. Entscheide, ob wir noch',
+    'weitere Quellen brauchen — wenn ja, schlage bis zu ' + RECURSE_TOP_K + ' neue',
+    'https-URLs vor, die als ergänzende/maßgebliche Quellen sinnvoll sind',
+    '(offizielle Doku, Hersteller-Seiten, Wikipedia, seriöse Vergleichs-',
+    'tests). Wenn die Runde-1-Quellen die Frage bereits ausreichend',
+    'beantworten, antworte mit leerem picks-Array.',
+    '',
+    'Antworte AUSSCHLIESSLICH mit einer einzigen Zeile JSON:',
+    '{"picks":[{"url":"https://…","reason":"kurze Begründung","gap":"welche Info fehlt noch"}]}',
+    'Wenn keine weiteren Quellen nötig sind: {"picks":[],"reason":"Runde 1 reicht aus"}.',
+    'Keine Erklärungen, kein Markdown, kein zusätzlicher Text.',
+    'Wichtig: KEINE URL wiederholen, die bereits in den Runde-1-Quellen steht.',
+    '',
+    `Nutzerfrage: ${String(userPrompt || '').slice(0, MAX_PROMPT_CHARS)}`,
+    '',
+    'Runde-1-Quellen (bereits gelesen, NICHT erneut vorschlagen):',
+  ];
+  for (let i = 0; i < sources.length; i += 1) {
+    const s = sources[i];
+    lines.push(`- [${i + 1}] ${s.title} — ${s.url}`);
+  }
+  lines.push('');
+  lines.push('Auszüge aus Runde 1 (zur Orientierung, was wir schon wissen):');
+  for (let i = 0; i < sources.length; i += 1) {
+    const s = sources[i];
+    lines.push(`---`);
+    lines.push(`Quelle ${i + 1}: ${s.title}`);
+    lines.push(`URL: ${s.url}`);
+    lines.push(s.markdown.slice(0, 1_500));
+  }
+  return lines.join('\n');
+}
+
 function buildCompositionPrompt(userPrompt, sources) {
   const lines = [
     'Du bist ein Antwort-Composer. Liefere eine schöne formatierte deutsche Antwort',
@@ -243,12 +306,13 @@ function buildCompositionPrompt(userPrompt, sources) {
   ];
   for (let i = 0; i < sources.length; i += 1) {
     const s = sources[i];
+    const perSourceBudget = Math.max(400, Math.floor(MAX_TOTAL_CHARS / Math.max(sources.length, 1)));
     lines.push(`---`);
-    lines.push(`Quelle ${i + 1}: ${s.title}`);
+    lines.push(`Quelle ${i + 1}: ${s.title}${s.round ? ` (${s.round})` : ''}`);
     lines.push(`URL: ${s.url}`);
     if (s.reason) lines.push(`Grund der Auswahl: ${s.reason}`);
     lines.push('');
-    lines.push(s.markdown.slice(0, MAX_TOTAL_CHARS / Math.max(sources.length, 1)));
+    lines.push(s.markdown.slice(0, perSourceBudget));
   }
   return lines.join('\n');
 }
@@ -301,6 +365,27 @@ function parseQwenPicks(raw) {
     const reason = typeof p.reason === 'string' ? p.reason : null;
     out.push({ url, reason });
     if (out.length >= PICK_TOP_K) break;
+  }
+  return { picks: out, reason: typeof obj.reason === 'string' ? obj.reason : null };
+}
+
+function parseQwenRefinePicks(raw) {
+  // Same shape as parseQwenPicks but capped at RECURSE_TOP_K and each pick
+  // carries an optional `gap` field explaining what info would still be
+  // missing if we DON'T scrape it.
+  const obj = parseJsonObject(raw);
+  if (!obj || typeof obj !== 'object') return null;
+  const picks = obj.picks;
+  if (!Array.isArray(picks)) return null;
+  const out = [];
+  for (const p of picks) {
+    if (!p || typeof p !== 'object') continue;
+    const url = p.url;
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) continue;
+    const reason = typeof p.reason === 'string' ? p.reason : null;
+    const gap = typeof p.gap === 'string' ? p.gap : null;
+    out.push({ url, reason, gap });
+    if (out.length >= RECURSE_TOP_K) break;
   }
   return { picks: out, reason: typeof obj.reason === 'string' ? obj.reason : null };
 }
@@ -373,6 +458,50 @@ async function rankResultsWithQwen(prompt, results, ctx) {
   }
   // If Qwen picked nothing, propagate the reason for the user-facing message.
   return parsed;
+}
+
+// Round-2 (recursion) wrapper: given round-1 sources, ask Qwen whether we
+// should scrape more URLs and which ones. Filters out any URL we already have
+// (round-1 sources + any in-flight round-2 picks) so Qwen doesn't get to
+// re-pick a page we already scraped.
+async function refineWithQwen(prompt, sources, ctx, { excludeUrls = [] } = {}) {
+  if (!Array.isArray(sources) || sources.length === 0) return { picks: [], reason: 'no_round1' };
+  if (RECURSE_MAX_DEPTH <= 0) return { picks: [], reason: 'recursion_disabled' };
+  const planningPrompt = buildRefinePrompt(prompt, sources);
+  let raw;
+  try {
+    raw = await qwen.run(planningPrompt, {
+      ...ctx,
+      requestId: ctx.requestId ? `${ctx.requestId}-qwen-refine` : 'firecrawl-qwen-refine',
+    });
+  } catch (err) {
+    const reason = err && err.message ? err.message : String(err);
+    return { picks: [], reason: `refine_failed:${reason}` };
+  }
+  const parsed = parseQwenRefinePicks(raw);
+  if (!parsed) {
+    return { picks: [], reason: 'refine_unparseable' };
+  }
+  // Drop anything that duplicates a round-1 URL or an already-included
+  // round-2 URL. Compare on the raw URL (case-insensitive, trailing-slash-
+  // insensitive) so "https://x.test" and "https://x.test/" are the same.
+  const seen = new Set(excludeUrls.map(normalizeUrl).filter(Boolean));
+  const out = [];
+  for (const p of parsed.picks) {
+    const key = normalizeUrl(p.url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return { picks: out, reason: parsed.reason };
+}
+
+function normalizeUrl(u) {
+  if (typeof u !== 'string') return null;
+  let v = u.trim();
+  if (!/^https?:\/\//i.test(v)) return null;
+  v = v.replace(/\/+$/, '').toLowerCase();
+  return v || null;
 }
 
 async function composeAnswerWithQwen(prompt, sources, ctx) {
@@ -540,38 +669,91 @@ async function runResearch(prompt, ctx, env) {
     );
   }
 
-  // Step 4: scrape each chosen URL, bounded by MAX_TOTAL_CHARS.
+  // Step 4: scrape round-1 picks.
   const sources = [];
   let totalChars = 0;
   for (let i = 0; i < ranked.picks.length; i += 1) {
     const pick = ranked.picks[i];
-    try {
-      const scraped = await callFirecrawlScrape({
-        apiKey: env.apiKey,
-        baseUrl: env.baseUrl,
-        url: pick.url,
-        requestId: `${env.requestId || 'firecrawl'}-scrape-${i + 1}`,
-      });
-      const md = (scraped && scraped.data && scraped.data.markdown) || '';
-      const title = (scraped && scraped.data && scraped.data.metadata && scraped.data.metadata.title) || pick.url;
-      const remaining = Math.max(0, MAX_TOTAL_CHARS - totalChars);
-      if (remaining <= 200) break;
-      const trimmed = md.length > remaining ? md.slice(0, remaining) + '\n\n[…gekürzt…]' : md;
-      totalChars += trimmed.length;
-      sources.push({ url: pick.url, title, reason: pick.reason, markdown: trimmed });
-    } catch (err) {
-      const reason = err && err.message ? err.message : String(err);
-      sources.push({
-        url: pick.url,
-        title: pick.url,
-        reason: pick.reason,
-        markdown: `_Scrape fehlgeschlagen:_ ${reason}`,
-      });
+    const remaining = Math.max(0, MAX_TOTAL_CHARS - totalChars);
+    if (remaining <= 200) break;
+    const source = await scrapeOne({
+      apiKey: env.apiKey,
+      baseUrl: env.baseUrl,
+      url: pick.url,
+      reason: pick.reason,
+      tag: `r1-${i + 1}`,
+      remainingChars: remaining,
+      requestId: env.requestId,
+    });
+    if (source) {
+      sources.push(source);
+      totalChars += source.markdown.length;
     }
   }
 
-  // Step 5: ask Qwen to compose the final answer.
+  // Step 5 (the recursion step the user asked for): feed Qwen the round-1
+  // material and let it propose NEW URLs to scrape — either authoritative
+  // sources it can name from its own knowledge, or pages it inferred from
+  // the round-1 content. This is the "let qwen create new scrape requests
+  // out of the links from the results" leg of the user's spec.
+  if (RECURSE_MAX_DEPTH > 0 && sources.length > 0) {
+    const refined = await refineWithQwen(prompt, sources, ctx, {
+      excludeUrls: sources.map((s) => s.url),
+    });
+    if (refined.picks.length > 0) {
+      for (let i = 0; i < refined.picks.length; i += 1) {
+        const pick = refined.picks[i];
+        const remaining = Math.max(0, MAX_TOTAL_CHARS - totalChars);
+        if (remaining <= 200) break;
+        const source = await scrapeOne({
+          apiKey: env.apiKey,
+          baseUrl: env.baseUrl,
+          url: pick.url,
+          reason: pick.reason || pick.gap || 'recursion-refined pick',
+          tag: `r2-${i + 1}`,
+          remainingChars: remaining,
+          requestId: env.requestId,
+        });
+        if (source) {
+          sources.push(source);
+          totalChars += source.markdown.length;
+        }
+      }
+    }
+  }
+
+  // Step 6: ask Qwen to compose the final answer.
   return composeAnswerWithQwen(prompt, sources, ctx);
+}
+
+// Single-URL scrape helper shared by round 1 and round 2. Bounded by
+// `remainingChars` so the combined markdown stays under MAX_TOTAL_CHARS.
+async function scrapeOne({ apiKey, baseUrl, url, reason, tag, remainingChars, requestId }) {
+  try {
+    const scraped = await callFirecrawlScrape({
+      apiKey,
+      baseUrl,
+      url,
+      requestId: requestId ? `${requestId}-${tag}` : `firecrawl-${tag}`,
+    });
+    const md = (scraped && scraped.data && scraped.data.markdown) || '';
+    const title =
+      (scraped && scraped.data && scraped.data.metadata && scraped.data.metadata.title) || url;
+    if (md.length > remainingChars) {
+      const trimmed = md.slice(0, remainingChars) + '\n\n[…gekürzt…]';
+      return { url, title, reason, markdown: trimmed, round: tag };
+    }
+    return { url, title, reason, markdown: md, round: tag };
+  } catch (err) {
+    const reasonText = err && err.message ? err.message : String(err);
+    return {
+      url,
+      title: url,
+      reason,
+      markdown: `_Scrape fehlgeschlagen:_ ${reasonText}`,
+      round: tag,
+    };
+  }
 }
 
 // --- Entry point ------------------------------------------------------------
@@ -706,14 +888,17 @@ module.exports = {
   planUrlWithQwen,
   formulateQueryWithQwen,
   rankResultsWithQwen,
+  refineWithQwen,
   composeAnswerWithQwen,
   normaliseSearchResults,
   parseQwenPick,
   parseQwenQuery,
   parseQwenPicks,
+  parseQwenRefinePicks,
   buildQwenPlanningPrompt,
   buildQueryFormulationPrompt,
   buildRankingPrompt,
+  buildRefinePrompt,
   buildCompositionPrompt,
   looksLikeResearchQuestion,
   DEFAULT_BASE_URL,
@@ -721,7 +906,10 @@ module.exports = {
   SCRAPE_PATH,
   SEARCH_LIMIT,
   PICK_TOP_K,
+  RECURSE_TOP_K,
+  RECURSE_MAX_DEPTH,
   MAX_TOTAL_CHARS,
   extractUrl,
+  normalizeUrl,
   stubMissingCredential,
 };
