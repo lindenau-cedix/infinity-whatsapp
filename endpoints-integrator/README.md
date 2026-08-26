@@ -23,29 +23,48 @@ infinity/
       perplexityReasoning.ts
       perplexityDeepResearch.ts
       firecrawl.ts
-  dispatcher/             # runtime JS dispatcher (used by register.js)
-    qwen.js               # local Qwen CLI adapter (`qwen -m qwen3:30b-a3b -p "..."`)
+  dispatcher/             # runnable JS adapters; Qwen CLI lives here
+    index.js
+    qwen.js               # local CLI; no API key, no HTTP
     perplexity.js
     firecrawl.js
-    shared.js
-    index.js
+    shared.js             # envKey, runWithRetry, trimForReply
 ```
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-# fill in real keys
+# fill in real keys (PERPLEXITY_API_KEY, FIRECRAWL_API_KEY)
+# Qwen Code is local-only — install the CLI on PATH; see QWEN_BIN below.
 chmod +x scripts/*.sh
-
-# Qwen runs locally on the VPS — no API key. Just install the CLI:
-#   https://github.com/QwenLM/Qwen3-Coder
-./scripts/smoke-qwen.sh
-
-# Perplexity / Firecrawl still need their cloud keys:
 PERPLEXITY_API_KEY=... ./scripts/smoke-perplexity-rp.sh
-FIRECRAWL_API_KEY=... ./scripts/smoke-firecrawl.sh
+FIRECRAWL_API_KEY=...    ./scripts/smoke-firecrawl.sh
+# Local-CLI smoke — no key needed:
+./scripts/smoke-qwen.sh
 ```
+
+## Firecrawl group — INFA-22 free-form prompts
+
+The Firecrawl WhatsApp group accepts both shapes:
+
+- A literal URL (legacy fast path): `scrape https://example.com` → Firecrawl
+  is called directly with that URL.
+- A free-form question (INFA-22): e.g. `Look up the best API for package
+  tracking.` → the local Qwen CLI picks a single URL that best answers the
+  question, then Firecrawl scrapes it. Qwen is told to reply with one JSON
+  line `{"url":"https://…"}` (or `{"url":null,"reason":"…"}` when it can't
+  decide) so the parser stays robust against fence / prose.
+
+Smoke test:
+
+```bash
+./scripts/smoke-firecrawl.sh url         # literal URL → /v1/scrape
+./scripts/smoke-firecrawl.sh freeform    # Qwen picks URL → /v1/scrape
+```
+
+The free-form mode needs the local `qwen` CLI on `PATH` (or `QWEN_BIN`).
+The URL-in-prompt mode has no Qwen dependency.
 
 ## Adapter contract
 

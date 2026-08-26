@@ -1,18 +1,59 @@
 #!/usr/bin/env bash
-# Smoke-test Firecrawl /v1/scrape.
-# Usage: ./smoke-firecrawl.sh
+# Smoke-test Firecrawl /v1/scrape — both modes the adapter supports (INFA-22):
+#
+#   1. URL-in-prompt (legacy path):  send a literal URL.
+#   2. Free-form prompt (new path):  let Qwen pick the URL.
+#
+# Set FIRECRAWL_API_KEY and (optionally) FIRECRAWL_BASE_URL. The Qwen path
+# additionally needs the local `qwen` CLI on PATH (or QWEN_BIN).
+#
+# Pretty-prints the response JSON via scripts/_pretty_json.sh (tries jq,
+# then node, then python3, then raw) so this works in any minimal runtime.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_pretty_json.sh
+. "${SCRIPT_DIR}/_pretty_json.sh"
 
 : "${FIRECRAWL_API_KEY:?FIRECRAWL_API_KEY must be set (see .env.example)}"
 : "${FIRECRAWL_BASE_URL:=https://api.firecrawl.dev}"
 
-curl -sS -X POST \
-  -H "Authorization: Bearer ${FIRECRAWL_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -H "X-Request-Id: smoke-firecrawl-$(date +%s)" \
-  "${FIRECRAWL_BASE_URL}/v1/scrape" \
-  -d '{
-    "url": "https://example.com",
-    "formats": ["markdown"],
-    "onlyMainContent": true
-  }' | jq .
+MODE="${1:-url}"   # url | freeform
+
+case "${MODE}" in
+  url)
+    echo "smoke-firecrawl: URL-in-prompt mode → /v1/scrape with literal URL"
+    curl -sS -X POST \
+      -H "Authorization: Bearer ${FIRECRAWL_API_KEY}" \
+      -H "Content-Type: application/json" \
+      -H "X-Request-Id: smoke-firecrawl-url-$(date +%s)" \
+      "${FIRECRAWL_BASE_URL}/v1/scrape" \
+      -d '{
+        "url": "https://example.com",
+        "formats": ["markdown"],
+        "onlyMainContent": true
+      }' | pretty_json
+    ;;
+  freeform)
+    echo "smoke-firecrawl: free-form-prompt mode → run dispatcher with a free question"
+    QWEN_BIN="${QWEN_BIN:-qwen}"
+    if ! command -v "${QWEN_BIN}" >/dev/null 2>&1; then
+      echo "smoke-firecrawl: qwen CLI not found at '${QWEN_BIN}'." >&2
+      echo "  → install from https://github.com/QwenLM/Qwen3-Coder, or set QWEN_BIN=<path>." >&2
+      echo "  → (the URL-in-prompt mode above still works without qwen)" >&2
+      exit 2
+    fi
+    node -e '
+      const { run } = require("./dispatcher/firecrawl.js");
+      run("Look up the best API for package tracking.", {
+        requestId: "smoke-firecrawl-freeform",
+      })
+        .then((t) => { console.log(t); })
+        .catch((e) => { console.error("firecrawl failed:", e.message); process.exit(1); });
+    '
+    ;;
+  *)
+    echo "smoke-firecrawl: unknown mode '${MODE}'. Use 'url' or 'freeform'." >&2
+    exit 64
+    ;;
+esac
