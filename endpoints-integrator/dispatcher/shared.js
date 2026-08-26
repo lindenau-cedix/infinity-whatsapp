@@ -124,6 +124,42 @@ function isFetchFailedWrapper(err) {
   );
 }
 
+/**
+ * Return true when the error chain is a `fetch failed` wrapper whose cause
+ * carries zero diagnostic information — no .code, no informative .name, and
+ * either no .cause at all or a .cause whose .message is also 'fetch failed'
+ * (or missing).
+ *
+ * INFA-24 follow-up (deeper): when EVERY retry produces this shape, the host
+ * almost certainly can't reach the endpoint at all (firewall, proxy drop,
+ * IPv6-only target with broken v4 fallback, etc.). Retrying the full
+ * attempts budget just burns the operator's 20-minute SLA window. Bail out
+ * fast and surface an actionable hint instead.
+ */
+function isFullyOpaqueFetchFailure(err) {
+  if (!isFetchFailedWrapper(err)) return false;
+  const inner = unwrapCause(err) || err;
+  if (inner && inner !== err) {
+    if (inner.code) return false;          // we DO have a code somewhere
+    if (inner.name && inner.name !== 'Error' && inner.name !== 'TypeError' && inner.name !== 'FetchError') return false;
+    if (inner.message && inner.message.trim() !== '' && inner.message.trim() !== 'fetch failed') return false;
+  }
+  // Wrapper itself + opaque cause (or no cause) + no code/name/message → bare.
+  return true;
+}
+
+/**
+ * Actionable hint surfaced when we give up on a fully-opaque fetch failure.
+ * Tells the operator what to check first on the host — most of the time the
+ * endpoint is simply unreachable from where the daemon is running.
+ */
+const HOST_CONNECTIVITY_HINT =
+  'Perplexity endpoint unreachable from this host. Check: ' +
+  '(1) outbound HTTPS to api.perplexity.ai is allowed by firewall/proxy; ' +
+  '(2) DNS resolves (e.g. `getent hosts api.perplexity.ai` returns an IP); ' +
+  '(3) no corporate TLS-inspection proxy is rewriting the cert chain; ' +
+  '(4) Node version is 18+ (uses undici fetch).';
+
 async function runWithRetry(fn, opts = {}) {
   const {
     attempts = 3,
@@ -131,7 +167,19 @@ async function runWithRetry(fn, opts = {}) {
     timeoutMs = 20_000,
     retryOn,
     adapter = 'unknown',
+    /**
+     * INFA-24 deeper: when every failure is a fully-opaque `fetch failed`
+     * wrapper (no .code, no informative .name, no informative .cause
+     * message), the host almost certainly can't reach the endpoint at all.
+     * Retrying the full attempts budget wastes the operator's SLA window.
+     * After `opaqueBailAfter` consecutive fully-opaque failures (default 2),
+     * give up early and surface a host-connectivity hint instead. Set to
+     * Infinity to disable.
+     */
+    opaqueBailAfter = 2,
   } = opts;
+
+  let consecutiveOpaque = 0;
 
   const shouldRetry = (err, status) => {
     if (err instanceof AuthError) return false; // never retry on bad creds
@@ -166,8 +214,24 @@ async function runWithRetry(fn, opts = {}) {
       lastErr = err;
       const status = err?.status;
       const retriable = shouldRetry(err, status);
+      // Track the "fully opaque" run separately. If we keep getting bare
+      // fetch-failed wrappers with no diagnostic, the host almost certainly
+      // can't reach the endpoint at all — burn the SLA window by retrying
+      // for the full attempts budget would just leave the operator waiting
+      // 20 minutes for the same opaque message.
+      if (isFullyOpaqueFetchFailure(err)) {
+        consecutiveOpaque += 1;
+      } else {
+        consecutiveOpaque = 0;
+      }
       clearTimeout(timer);
       if (!retriable || attempt === attempts) break;
+      // INFA-24 deeper: bail out early when we've accumulated
+      // `opaqueBailAfter` consecutive fully-opaque failures with no signal
+      // that anything is changing. The host is almost certainly offline to
+      // this endpoint; the operator needs a clear hint, not another 18
+      // minutes of identical errors.
+      if (consecutiveOpaque >= opaqueBailAfter) break;
       // exponential backoff: base * 2^(attempt-1), with a tiny jitter
       const jitter = Math.floor(Math.random() * 80);
       const wait = baseDelayMs * 2 ** (attempt - 1) + jitter;
@@ -193,12 +257,65 @@ async function runWithRetry(fn, opts = {}) {
   } else {
     detail = lastErr?.message || 'fetch failed';
   }
-  throw new DispatcherError(adapter, 'all retries exhausted', Object.assign(new Error(detail), {
+  // INFA-24 deeper: when the cause chain was fully opaque across the whole
+  // retry budget, the failure is almost certainly a host-connectivity issue
+  // rather than a transient blip. Surface the connectivity hint inline so
+  // the operator doesn't have to guess what's wrong.
+  let envelopeMessage = 'all retries exhausted';
+  if (consecutiveOpaque >= opaqueBailAfter && isFullyOpaqueFetchFailure(lastErr)) {
+    envelopeMessage = `all retries exhausted (early bail: ${consecutiveOpaque} consecutive opaque fetch failures) — ${HOST_CONNECTIVITY_HINT}`;
+  }
+  throw new DispatcherError(adapter, envelopeMessage, Object.assign(new Error(detail), {
     cause: lastErr,
     code: inner?.code,
     name: inner?.name || lastErr?.name,
     status: lastErr?.status,
   }));
+}
+
+/**
+ * Boot-time reachability probe for a provider's base URL.
+ *
+ * INFA-24 deeper: a host that can't reach the provider should be flagged at
+ * boot, not after the first user request burns 20 minutes on Perplexity
+ * deep-research. This is intentionally cheap: short timeout, GET (most
+ * providers accept GET on the root with a 401/405 response), and we DO NOT
+ * leak the API key (the probe is unauthenticated on purpose).
+ *
+ * Returns { reachable: boolean, status?: number, error?: string }. Never
+ * throws — callers log the result and proceed.
+ *
+ * @param {string} baseUrl  e.g. https://api.perplexity.ai
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs=5000]  per-attempt timeout
+ * @param {number} [opts.attempts=2]      total tries (1 + 1 retry)
+ */
+async function probeEndpoint(baseUrl, opts = {}) {
+  const { timeoutMs = 5_000, attempts = 2 } = opts;
+  const url = `${(baseUrl || '').replace(/\/$/, '')}/`;
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { method: 'GET', signal: controller.signal });
+      clearTimeout(timer);
+      // Any HTTP response (including 401/405/404) means the host CAN reach
+      // the endpoint. Only a network-level failure counts as unreachable.
+      return { reachable: true, status: res.status };
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+      if (i < attempts) await sleep(250);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return {
+    reachable: false,
+    error: lastErr?.message || 'unknown error',
+    cause: lastErr?.cause?.message,
+  };
 }
 
 function trimForReply(text, maxChars = 3500) {
@@ -214,4 +331,9 @@ module.exports = {
   runWithRetry,
   sleep,
   trimForReply,
+  probeEndpoint,
+  isFetchFailedWrapper,
+  isFullyOpaqueFetchFailure,
+  unwrapCause,
+  HOST_CONNECTIVITY_HINT,
 };

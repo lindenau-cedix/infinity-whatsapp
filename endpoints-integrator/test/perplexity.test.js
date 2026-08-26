@@ -336,13 +336,123 @@ test('perplexity: persistent bare "fetch failed" with no cause still surfaces re
     try {
       await assert.rejects(
         () => real.run('hi', { model: 'sonar-deep-research' }),
-        (err) => /fetch failed/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)),
+        // INFA-24 deeper: the envelope now includes the host-connectivity
+        // hint because consecutive opaque failures look like a
+        // firewall/proxy problem, not a Perplexity outage.
+        (err) => /fetch failed/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
       );
-      // 4 attempts for deep-research (attempts=4) — confirms we DID retry
-      // instead of giving up after the first opaque failure.
-      assert.equal(calls, 4, 'opaque fetch failed should still be retried 3 times');
+      // INFA-24 deeper: with the new opaqueBailAfter=2 default, deep-research
+      // bails after 2 consecutive fully-opaque failures instead of burning
+      // the full 4×300s ≈ 20min budget waiting for a signal that never
+      // comes. We still DO retry (it's not 1) so a single transient blip
+      // recovers normally.
+      assert.equal(calls, 2, 'opaque fetch failed should bail after 2 attempts with the host-connectivity hint');
     } finally {
       restore();
     }
   });
+});
+
+test('perplexity: deep-research recovers on first attempt when wrapper has a code (INFA-24 deeper)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        // Has a code on the cause — NOT fully opaque. Should retry normally
+        // and recover; opaqueBailAfter must NOT trip here.
+        const cause = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-with-code' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-with-code/);
+      assert.equal(calls, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research bails early on persistent opaque failures with connectivity hint (INFA-24 deeper)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      // Persistent opaque failure — no cause, no code, no name.
+      throw new TypeError('fetch failed');
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /early bail/i.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
+      );
+      // Bail after opaqueBailAfter=2 consecutive opaque failures (NOT 4).
+      assert.equal(calls, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: opaqueBailAfter option can disable early bail (INFA-24 deeper)', async () => {
+  // Drive the dispatcher directly via the shared module so we can pass
+  // opaqueBailAfter=Infinity and verify the legacy behaviour still works.
+  const { runWithRetry } = require('../dispatcher/shared.js');
+  let calls = 0;
+  const original = global.fetch;
+  global.fetch = async () => {
+    calls += 1;
+    throw new TypeError('fetch failed');
+  };
+  try {
+    await assert.rejects(
+      () => runWithRetry(() => fetch('https://example.test/x'), {
+        adapter: 'test',
+        attempts: 4,
+        timeoutMs: 100,
+        baseDelayMs: 1,
+        opaqueBailAfter: Infinity,
+      }),
+      (err) => /all retries exhausted/.test(String(err.message)) && !/early bail/i.test(String(err.message)),
+    );
+    assert.equal(calls, 4);
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test('probeEndpoint: reachable host returns reachable=true with status', async () => {
+  const { probeEndpoint } = require('../dispatcher/shared.js');
+  const original = global.fetch;
+  global.fetch = async () => ({ status: 401 });
+  try {
+    const r = await probeEndpoint('https://example.test');
+    assert.equal(r.reachable, true);
+    assert.equal(r.status, 401);
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test('probeEndpoint: unreachable host returns reachable=false with cause', async () => {
+  const { probeEndpoint } = require('../dispatcher/shared.js');
+  const original = global.fetch;
+  global.fetch = async () => {
+    const cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    throw Object.assign(new TypeError('fetch failed'), { cause });
+  };
+  try {
+    const r = await probeEndpoint('https://does-not-exist.test');
+    assert.equal(r.reachable, false);
+    assert.match(r.cause, /ECONNREFUSED/);
+  } finally {
+    global.fetch = original;
+  }
 });
