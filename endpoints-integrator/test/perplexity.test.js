@@ -511,3 +511,113 @@ test('probeEndpoint: unreachable host returns reachable=false with cause', async
     global.fetch = original;
   }
 });
+
+// INFA-24 widening: some Perplexity moderation refusals (e.g. for sensitive
+// pharmacology queries like DSIP) surface as `TypeError("fetch failed")`
+// with the HTTP status and body buried on `.cause.{status,body}`. Before
+// this widening the dispatcher classified those as fully-opaque transport
+// failures and showed the connectivity-hint envelope — wrong, since the
+// upstream had refused the query, the host was perfectly reachable. The
+// fix: unwrapCause() now surfaces a `.status` from the cause chain, the
+// retry classifier treats 4xx (except 408/429) as terminal, and the
+// envelope shows `fetch failed (HTTP 422) — <body>` instead of a generic
+// connectivity hint.
+
+test('perplexity: 422 moderation refusal wrapped in fetch-failed surfaces status + body (INFA-24 widening)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      // Mirror undici surfacing a half-streamed Perplexity moderation
+      // refusal: the upstream opens, sends HTTP 422, then aborts the body
+      // read. undici throws TypeError("fetch failed") with the real status
+      // and body on the cause.
+      const cause = Object.assign(
+        new Error('Failed to call moderation endpoint'),
+        {
+          status: 422,
+          body: JSON.stringify({ error: 'Failed to call moderation endpoint' }),
+        },
+      );
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('What is the pharmacological profile of DSIP?', {
+          model: 'sonar-deep-research',
+        }),
+        (err) => {
+          const msg = String(err.message);
+          // Envelope MUST surface the HTTP status, not just "fetch failed".
+          assert.ok(/HTTP 422/.test(msg), `expected "HTTP 422" in message, got: ${msg}`);
+          // Envelope MUST surface the moderation keyword so the operator
+          // can see the real reason without digging through logs.
+          assert.ok(/moderation/i.test(msg), `expected "moderation" in message, got: ${msg}`);
+          // 4xx (non-408/429) is per-query — must NOT retry.
+          assert.equal(calls, 1, `expected exactly 1 call (no retry on 422), got ${calls}`);
+          return true;
+        },
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: a plain 422 from upstream surfaces status + body without retry (INFA-24 widening)', async () => {
+  // Companion to the wrapper test above: same shape, but the response
+  // comes through cleanly (no abort mid-body). runWithRetry must still
+  // bail without retrying and surface the status + body.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const restore = fakeFetch({
+      [URL]: () => {
+        calls += 1;
+        return okJson({ error: 'Failed to call moderation endpoint' }, 422);
+      },
+    });
+    try {
+      await assert.rejects(
+        () => real.run('a', { model: 'sonar-deep-research' }),
+        (err) => {
+          const msg = String(err.message);
+          assert.ok(/422/.test(msg), `expected "422" in message, got: ${msg}`);
+          assert.ok(/moderation/i.test(msg), `expected "moderation" in message, got: ${msg}`);
+          return true;
+        },
+      );
+      assert.equal(calls, 1, '422 must not be retried');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: 429 wrapped in fetch-failed IS still retried (INFA-24 widening carve-out)', async () => {
+  // 429 is the canonical "rate limited, back off" code — it must remain
+  // retriable even when surfaced through a fetch-failed wrapper. The
+  // 4xx-not-retriable rule applies to "the request itself was refused",
+  // not to rate-limit retries.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        const cause = Object.assign(new Error('rate limited'), { status: 429 });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-after-429' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('a', { model: 'sonar-reasoning-pro' });
+      assert.match(text, /recovered-after-429/);
+      assert.equal(calls, 2, '429 must still retry after a fetch-failed wrapper');
+    } finally {
+      restore();
+    }
+  });
+});

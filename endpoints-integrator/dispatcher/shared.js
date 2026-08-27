@@ -94,14 +94,32 @@ const RETRIABLE_NETWORK_CODES = new Set([
  * and in those cases the wrapper message IS the only diagnostic. Without
  * this helper the operator sees "fetch failed" with no signal why.
  *
- * We honour `code` first (most informative), then `name` (skips the generic
- * wrappers, accepts anything informative), and fall back to the wrapper
- * itself so its `.message` is still available downstream.
+ * INFA-24 widening: some upstream failures (notably Perplexity sonar-deep-
+ * research moderation refusals) surface as `TypeError("fetch failed")` with
+ * the HTTP status and body buried on `.cause.{status,body}`. Before this
+ * widening the cause walk skipped past those (no .code, .name was generic)
+ * and the dispatcher classified the whole envelope as a transparent
+ * transport failure — operators saw "all retries exhausted: fetch failed"
+ * with no hint that the request had been refused by the moderation
+ * endpoint. The walk now also accepts a `.status` as a useful diagnostic so
+ * a HTTP 4xx refusal is surfaced clearly.
+ *
+ * We honour `code` first (most informative), then `status` (catches
+ * 4xx/5xx buried in the cause chain — see INFA-24 widening), then `name`
+ * (skips the generic wrappers, accepts anything informative), and fall back
+ * to the wrapper itself so its `.message` is still available downstream.
  */
 function unwrapCause(err) {
   let cur = err;
   for (let i = 0; cur && i < 5; i++) {
     if (cur.code) return cur;
+    // HTTP status on the cause: undici sometimes attaches `.status` (and
+    // `.body`) to the cause when an upstream response is read partially.
+    // 4xx in particular is the smoking gun for a per-query refusal (e.g.
+    // Perplexity moderation) wrapped in a `fetch failed` envelope. We
+    // surface it like a code so the retry classifier and the error
+    // envelope can both see it.
+    if (typeof cur.status === 'number' && cur.status >= 100 && cur.status < 600) return cur;
     if (cur.name && cur.name !== 'Error' && cur.name !== 'TypeError' && cur.name !== 'FetchError') return cur;
     cur = cur.cause;
   }
@@ -135,16 +153,26 @@ function isFetchFailedWrapper(err) {
  * IPv6-only target with broken v4 fallback, etc.). Retrying the full
  * attempts budget just burns the operator's 20-minute SLA window. Bail out
  * fast and surface an actionable hint instead.
+ *
+ * INFA-24 widening: a `.status` on the cause (or on the wrapper itself)
+ * counts as a diagnostic. Without this carve-out, an upstream 4xx moderation
+ * refusal wrapped in `TypeError("fetch failed")` was being classified as
+ * fully opaque, the operator saw the connectivity-hint envelope, and the
+ * real reason (the upstream rejected the query) was buried in the cause's
+ * `.message`. With the carve-out the cause walk has somewhere to land and
+ * `isFullyOpaqueFetchFailure` correctly returns false.
  */
 function isFullyOpaqueFetchFailure(err) {
   if (!isFetchFailedWrapper(err)) return false;
   const inner = unwrapCause(err) || err;
   if (inner && inner !== err) {
     if (inner.code) return false;          // we DO have a code somewhere
+    // INFA-24 widening: a .status on the unwrapped chain is a diagnostic.
+    if (typeof inner.status === 'number' && inner.status >= 100 && inner.status < 600) return false;
     if (inner.name && inner.name !== 'Error' && inner.name !== 'TypeError' && inner.name !== 'FetchError') return false;
     if (inner.message && inner.message.trim() !== '' && inner.message.trim() !== 'fetch failed') return false;
   }
-  // Wrapper itself + opaque cause (or no cause) + no code/name/message → bare.
+  // Wrapper itself + opaque cause (or no cause) + no code/status/name/message → bare.
   return true;
 }
 
@@ -193,14 +221,33 @@ async function runWithRetry(fn, opts = {}) {
 
   const shouldRetry = (err, status) => {
     if (err instanceof AuthError) return false; // never retry on bad creds
+    // INFA-24 widening: when the cause chain carries an HTTP status
+    // (e.g. undici surfaces a Perplexity moderation 422 as
+    // `TypeError("fetch failed")` with the status on `.cause`), the
+    // `status` argument may not see it. Unwrap here so a 4xx buried in the
+    // cause chain still short-circuits to non-retriable below.
+    const innerForStatus = unwrapCause(err) || err;
+    const effectiveStatus = status ?? innerForStatus?.status;
     // 401/403 from upstream = bad creds. Never retry — rotating the key is
     // the only fix, and hammering the provider just gets us rate-limited.
-    if (status === 401 || status === 403) return false;
+    if (effectiveStatus === 401 || effectiveStatus === 403) return false;
+    // INFA-24 widening: 4xx (except 408 / 429) is a per-request refusal
+    // (moderation block, validation error, unsupported model, ...). It is
+    // NEVER a transport blip — retrying just hits the same refusal and
+    // burns the operator's SLA window. The envelope should surface the real
+    // status + body so the caller knows the upstream rejected the query.
+    if (
+      effectiveStatus && effectiveStatus >= 400 && effectiveStatus < 500 &&
+      effectiveStatus !== 408 && effectiveStatus !== 429
+    ) return false;
+    // 408 (Request Timeout) is technically retriable, and 429 (Rate
+    // Limited) is the canonical "back off and try again" code. Handle them
+    // via the explicit status branches below.
     if (retryOn) {
-      return retryOn.some((r) => (typeof r === 'number' ? r === status : err?.name === r));
+      return retryOn.some((r) => (typeof r === 'number' ? r === effectiveStatus : err?.name === r));
     }
-    if (status === 429) return true;
-    if (status && status >= 500 && status < 600) return true;
+    if (effectiveStatus === 408 || effectiveStatus === 429) return true;
+    if (effectiveStatus && effectiveStatus >= 500 && effectiveStatus < 600) return true;
     // Unwrap undici's `fetch failed` wrapper so we see the real code/name.
     const inner = unwrapCause(err) || err;
     if (inner.name === 'AbortError') return true;
@@ -253,15 +300,32 @@ async function runWithRetry(fn, opts = {}) {
   // Surface the underlying cause chain so operators don't see a bare
   // "fetch failed" when the real error is ECONNRESET / EAI_AGAIN / a
   // TLS-race AbortError / an undici socket drop. The envelope prefers
-  // (code > name > cause-message) so even opaque wrappers like undici-22+
-  // `Error('fetch failed')` with no .cause at least tell the operator
-  // "fetch failed (cause: <message>)" instead of a bare "fetch failed".
+  // (code > status > name > cause-message) so even opaque wrappers like
+  // undici-22+ `Error('fetch failed')` with no .cause at least tell the
+  // operator "fetch failed (cause: <message>)" instead of a bare
+  // "fetch failed".
+  //
+  // INFA-24 widening: when the cause chain carries an HTTP status (e.g.
+  // undici surfaces a Perplexity moderation 422 as `TypeError("fetch
+  // failed")` with the status buried on `.cause`), prefer that as the tag
+  // — "fetch failed (HTTP 422)" is dramatically more actionable than
+  // "fetch failed (cause: ...)". We append a short body excerpt when
+  // present so the operator can see WHY the upstream refused without
+  // having to dig through logs.
   const inner = unwrapCause(lastErr) || lastErr;
-  const innerTag = inner?.code
-    || (inner?.name && inner.name !== 'Error' && inner.name !== 'TypeError' && inner.name !== 'FetchError' ? inner.name : null);
+  const innerCode = inner?.code;
+  const innerStatus = typeof inner?.status === 'number' ? inner.status : null;
+  const innerName = inner?.name && inner.name !== 'Error' && inner.name !== 'TypeError' && inner.name !== 'FetchError' ? inner.name : null;
   let detail;
-  if (innerTag) {
-    detail = `${lastErr?.message || 'fetch failed'} (${innerTag})`;
+  if (innerCode) {
+    detail = `${lastErr?.message || 'fetch failed'} (${innerCode})`;
+  } else if (innerStatus) {
+    const bodyExcerpt = typeof inner?.body === 'string' && inner.body.trim() !== ''
+      ? ` — ${inner.body.trim().slice(0, 200)}`
+      : '';
+    detail = `${lastErr?.message || 'fetch failed'} (HTTP ${innerStatus})${bodyExcerpt}`;
+  } else if (innerName) {
+    detail = `${lastErr?.message || 'fetch failed'} (${innerName})`;
   } else if (lastErr?.cause && typeof lastErr.cause.message === 'string' && lastErr.cause.message.trim() !== 'fetch failed') {
     detail = `${lastErr.message || 'fetch failed'} (cause: ${lastErr.cause.message})`;
   } else {
