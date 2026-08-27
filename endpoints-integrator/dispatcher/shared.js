@@ -80,7 +80,71 @@ const RETRIABLE_NETWORK_CODES = new Set([
   'EHOSTUNREACH',
   'UND_ERR_SOCKET',
   'UND_ERR_CONNECT_TIMEOUT',
+  // INFA-24 root cause: undici aborts a request whose *headers* (or body)
+  // take longer than its own 300s default, and reports it as a bare
+  // `TypeError: fetch failed`. sonar-deep-research streams nothing until the
+  // report is complete, so a normal 2–5min call lands right on that cliff.
+  // These are timeouts, not connectivity failures — retriable, and
+  // deliberately NOT part of the unreachable-host cluster below.
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
 ]);
+
+/**
+ * Timeout-flavoured undici codes. These mean "the upstream took too long",
+ * NOT "this host cannot reach the upstream" — see INFA-24. Keeping them out
+ * of the unreachable-host cluster is what stops the dispatcher from telling
+ * operators to go audit a firewall that was never the problem.
+ */
+const TIMEOUT_CODES = new Set([
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'ETIMEDOUT',
+]);
+
+/**
+ * Build a fetch dispatcher for long-running requests.
+ *
+ * INFA-24: undici defaults `headersTimeout` and `bodyTimeout` to 300_000ms.
+ * `sonar-deep-research` regularly needs longer than that and sends no bytes
+ * at all until it finishes, so undici kills the socket underneath us and
+ * surfaces an opaque `fetch failed`. Measured on the live API: 121s and 185s
+ * for trivial prompts — the 300s ceiling is genuinely within reach.
+ *
+ * We disable undici's internal timers (0 = no timeout) and let the caller's
+ * AbortController be the single source of truth for the deadline. Two timers
+ * racing over the same request is what produced the original bug.
+ *
+ * `undici` is NOT a declared dependency of this package (Node's global fetch
+ * is built on it, but the module isn't guaranteed to be resolvable). The
+ * require is therefore optional: if it's missing we return undefined and the
+ * caller falls back to plain global fetch.
+ *
+ * @param {number} timeoutMs  caller's own deadline; only used to decide
+ *                            whether a custom dispatcher is worth building.
+ * @returns {object|undefined} an undici Agent, or undefined when unavailable
+ */
+let _longRequestAgent;
+let _longRequestAgentTried = false;
+function getLongRequestDispatcher(timeoutMs) {
+  // Only bother for requests that can plausibly exceed undici's 300s default.
+  if (!timeoutMs || timeoutMs < 60_000) return undefined;
+  if (_longRequestAgentTried) return _longRequestAgent;
+  _longRequestAgentTried = true;
+  try {
+    // eslint-disable-next-line global-require
+    const { Agent } = require('undici');
+    _longRequestAgent = new Agent({
+      headersTimeout: 0,      // no cap — AbortController owns the deadline
+      bodyTimeout: 0,
+      keepAliveTimeout: 10_000,
+      keepAliveMaxTimeout: 60_000,
+    });
+  } catch {
+    _longRequestAgent = undefined; // undici not resolvable → plain fetch
+  }
+  return _longRequestAgent;
+}
 
 /**
  * Walk an error's cause chain looking for the first entry with a useful
@@ -211,6 +275,14 @@ async function runWithRetry(fn, opts = {}) {
      * with the same host-connectivity hint.
      */
     opaqueBailAfter = 2,
+    /**
+     * INFA-24: base URL used to verify an "unreachable host" claim before we
+     * make it. When the retry loop decides the host looks unreachable, we
+     * probe this URL once; if it answers, the envelope says "endpoint is up,
+     * your request timed out" instead of sending the operator to audit a
+     * firewall. Omit to skip verification (the legacy hint is then used).
+     */
+    probeBaseUrl,
   } = opts;
 
   // Counts consecutive failures that smell like host-connectivity trouble,
@@ -318,7 +390,16 @@ async function runWithRetry(fn, opts = {}) {
   const innerName = inner?.name && inner.name !== 'Error' && inner.name !== 'TypeError' && inner.name !== 'FetchError' ? inner.name : null;
   let detail;
   if (innerCode) {
-    detail = `${lastErr?.message || 'fetch failed'} (${innerCode})`;
+    // INFA-24: name the timeout explicitly. `fetch failed
+    // (UND_ERR_HEADERS_TIMEOUT)` is opaque to an operator; saying the upstream
+    // exceeded the deadline points straight at the fix.
+    if (TIMEOUT_CODES.has(innerCode) || innerCode === 'UND_ERR_CONNECT_TIMEOUT') {
+      detail =
+        `${lastErr?.message || 'fetch failed'} (${innerCode}) — upstream exceeded ` +
+        `the ${timeoutMs}ms per-attempt deadline before responding`;
+    } else {
+      detail = `${lastErr?.message || 'fetch failed'} (${innerCode})`;
+    }
   } else if (innerStatus) {
     const bodyExcerpt = typeof inner?.body === 'string' && inner.body.trim() !== ''
       ? ` — ${inner.body.trim().slice(0, 200)}`
@@ -346,9 +427,29 @@ async function runWithRetry(fn, opts = {}) {
     consecutiveUnreachable >= opaqueBailAfter &&
     (isFullyOpaqueFetchFailure(lastErr) || isTransportClusterError(lastErr));
   if (terminalUnreachable) {
-    envelopeMessage =
-      `all retries exhausted (early bail: ${consecutiveUnreachable} consecutive ` +
-      `unreachable-host failures) — ${HOST_CONNECTIVITY_HINT}`;
+    // INFA-24 correction: do NOT assert "host unreachable" on classification
+    // alone. The previous iteration told operators the Perplexity endpoint was
+    // unreachable while the host could in fact reach it fine (verified: curl
+    // 200, plain fetch 401) — the real fault was a timeout race. Confirm with
+    // a cheap live probe before making that claim, and describe what we
+    // actually observed when the probe succeeds.
+    let probe = null;
+    if (probeBaseUrl) {
+      probe = await probeEndpoint(probeBaseUrl, { timeoutMs: 5_000, attempts: 1 })
+        .catch(() => null);
+    }
+    if (probe && probe.reachable) {
+      envelopeMessage =
+        `all retries exhausted (${consecutiveUnreachable} consecutive transport failures, ` +
+        `but a live probe reached ${probeBaseUrl} with HTTP ${probe.status}) — ` +
+        `the endpoint is UP, so this is a slow/aborted request rather than a ` +
+        `connectivity problem. Most likely the model exceeded the per-attempt ` +
+        `timeout (${timeoutMs}ms); retry, shorten the prompt, or raise the timeout.`;
+    } else {
+      envelopeMessage =
+        `all retries exhausted (early bail: ${consecutiveUnreachable} consecutive ` +
+        `unreachable-host failures) — ${HOST_CONNECTIVITY_HINT}`;
+    }
   }
   throw new DispatcherError(adapter, envelopeMessage, Object.assign(new Error(detail), {
     cause: lastErr,
@@ -388,6 +489,13 @@ const TRANSPORT_FATAL_NAMES = new Set([
 function isTransportClusterError(err) {
   if (!err) return false;
   const inner = unwrapCause(err) || err;
+  // INFA-24 correction: a *timeout* is not an unreachable host. undici's
+  // headers/body timeouts fire on slow-but-perfectly-reachable upstreams
+  // (sonar-deep-research routinely needs 2–5min). Classifying those as
+  // "unreachable" sent operators to debug a firewall that was fine while
+  // the real fix was raising the deadline. Exclude them explicitly.
+  if (inner?.code && TIMEOUT_CODES.has(inner.code)) return false;
+  if (inner?.name === 'HeadersTimeoutError' || inner?.name === 'BodyTimeoutError') return false;
   if (inner?.code && RETRIABLE_NETWORK_CODES.has(inner.code)) return true;
   if (inner?.name && TRANSPORT_FATAL_NAMES.has(inner.name)) return true;
   // undici surfaces UND_ERR_* via `.name` on the inner error in some
@@ -455,9 +563,12 @@ module.exports = {
   sleep,
   trimForReply,
   probeEndpoint,
+  getLongRequestDispatcher,
   isFetchFailedWrapper,
   isFullyOpaqueFetchFailure,
   isTransportClusterError,
   unwrapCause,
   HOST_CONNECTIVITY_HINT,
+  RETRIABLE_NETWORK_CODES,
+  TIMEOUT_CODES,
 };

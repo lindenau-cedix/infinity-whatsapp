@@ -21,7 +21,7 @@
 
 'use strict';
 
-const { envKey, runWithRetry, trimForReply } = require('./shared.js');
+const { envKey, runWithRetry, trimForReply, getLongRequestDispatcher } = require('./shared.js');
 
 const DEFAULT_BASE_URL = 'https://api.perplexity.ai';
 const DEFAULT_MODELS = {
@@ -52,8 +52,16 @@ function pickModel(model) {
  * @param {string} [args.baseUrl]
  * @param {object} [args.signal]  AbortSignal for timeouts
  */
-async function callPerplexity({ apiKey, model, prompt, requestId, baseUrl, signal }) {
+async function callPerplexity({ apiKey, model, prompt, requestId, baseUrl, signal, timeoutMs }) {
   const url = `${(baseUrl || DEFAULT_BASE_URL).replace(/\/$/, '')}/chat/completions`;
+  // INFA-24 root cause: undici caps headersTimeout/bodyTimeout at 300s by
+  // default. sonar-deep-research emits NOTHING until the report is finished
+  // (measured live: 121s and 185s for trivial prompts), so a real query sits
+  // right on that cliff and undici kills the socket — surfacing as a bare
+  // `TypeError: fetch failed`. Hand long calls a dispatcher with those timers
+  // disabled so the AbortController below is the only deadline in play.
+  // Undefined for short calls, or when `undici` isn't resolvable.
+  const dispatcher = getLongRequestDispatcher(timeoutMs);
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -66,6 +74,7 @@ async function callPerplexity({ apiKey, model, prompt, requestId, baseUrl, signa
       messages: [{ role: 'user', content: prompt }],
     }),
     signal,
+    ...(dispatcher ? { dispatcher } : {}),
   });
 
   if (res.status === 401 || res.status === 403) {
@@ -125,20 +134,29 @@ async function run(prompt, ctx = {}) {
   const requestId = ctx.requestId || `perp-${Date.now()}`;
 
   // Deep research runs longer — Perplexity's docs say 30s–5min per call.
-  // 300s per-attempt with 4 attempts (1 + 3 retries) bounds a single deep-
-  // research call at ~20min worst case before we surface the failure to the
-  // operator, instead of giving up after 6min. Reasoning stays tight.
+  // INFA-24: deep-research needs a deadline ABOVE undici's 300s default, not
+  // equal to it. The old value was exactly 300_000 — the same number undici
+  // uses for headersTimeout — so the two timers raced and undici usually won,
+  // producing an opaque `fetch failed`. We now disable undici's internal
+  // timers (see getLongRequestDispatcher) and own the deadline here.
+  // Measured live: trivial deep-research prompts take 121s–185s, and
+  // Perplexity documents up to 5min, so 300s left no headroom at all.
+  // 600s x 3 attempts keeps the worst case near the old ~20min ceiling.
   const isDeepResearch = ctx.model === 'sonar-deep-research';
-  const timeoutMs = isDeepResearch ? 300_000 : 45_000;
-  const attempts = isDeepResearch ? 4 : 3;
+  const timeoutMs = isDeepResearch ? 600_000 : 90_000;
+  const attempts = isDeepResearch ? 3 : 3;
 
   const json = await runWithRetry(
-    ({ signal }) => callPerplexity({ apiKey, model, prompt, requestId, baseUrl, signal }),
+    ({ signal }) => callPerplexity({ apiKey, model, prompt, requestId, baseUrl, signal, timeoutMs }),
     {
       adapter: `perplexity/${ctx.model}`,
       attempts,
       baseDelayMs: 500,
       timeoutMs,
+      // Verify before blaming the network: if the endpoint answers this
+      // probe, the envelope reports a slow request instead of falsely
+      // telling the operator the host can't reach Perplexity (INFA-24).
+      probeBaseUrl: baseUrl,
     },
   );
 
