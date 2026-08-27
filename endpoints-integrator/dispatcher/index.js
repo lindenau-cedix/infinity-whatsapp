@@ -35,6 +35,7 @@
 const qwen = require('./qwen.js');
 const perplexity = require('./perplexity.js');
 const firecrawl = require('./firecrawl.js');
+const { probeEndpoint } = require('./shared.js');
 
 const VALID_KEYS = new Set([
   'qwen',
@@ -42,6 +43,31 @@ const VALID_KEYS = new Set([
   'perplexity-deep-research',
   'firecrawl',
 ]);
+
+/**
+ * INFA-24 deeper: at boot, probe each cloud provider's base URL so a
+ * disconnected host fails fast in the logs instead of waiting until the
+ * first user request. The probe is unauthenticated (cheap, no API-key
+ * leak) and only logs warnings — runtime traffic is unaffected.
+ *
+ * Disable with `INFINITY_SKIP_BOOT_PROBE=1` when running unit tests that
+ * stub fetch.
+ */
+async function probeAtBoot() {
+  if (process.env.INFINITY_SKIP_BOOT_PROBE === '1') return;
+  const baseUrl = process.env.PERPLEXITY_BASE_URL || 'https://api.perplexity.ai';
+  const result = await probeEndpoint(baseUrl);
+  if (!result.reachable) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[integrator] WARNING: Perplexity endpoint ${baseUrl} unreachable at boot — ` +
+      `first live call will likely fail. cause: ${result.cause || result.error}`,
+    );
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(`[integrator] Perplexity endpoint reachable (HTTP ${result.status})`);
+  }
+}
 
 /**
  * Dispatch a prompt to the right adapter.
@@ -84,4 +110,16 @@ function listEndpoints() {
   return [...VALID_KEYS];
 }
 
-module.exports = { dispatch, listEndpoints };
+module.exports = { dispatch, listEndpoints, probeAtBoot };
+
+// Fire-and-forget — the boot probe is best-effort and must not block module
+// load. Errors are swallowed and logged; callers don't await it.
+if (
+  process.env.INFINITY_SKIP_BOOT_PROBE !== '1' &&
+  process.env.NODE_ENV !== 'test'
+) {
+  probeAtBoot().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.warn(`[integrator] boot probe crashed (non-fatal): ${err?.message || err}`);
+  });
+}

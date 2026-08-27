@@ -18,6 +18,14 @@
 // with 1 retry (matches Perplexity's documented 30s–5min bound) and the
 // error envelope surfaces the underlying code (ECONNRESET, EAI_AGAIN, …)
 // instead of just "fetch failed".
+//
+// INFA-24 follow-up: the first iteration only retried when the cause chain
+// had a known .code. undici 22+ and several TLS/proxy races surface
+// transport failures as `TypeError('fetch failed')` or
+// `Error('fetch failed')` with a null or code-less .cause. The retry
+// classifier now treats the wrapper itself as retriable, and the error
+// envelope surfaces the cause's message when no .code/.name is available.
+// Mirrors dispatcher/shared.js — keep the two in sync.
 // =============================================================================
 
 import type { EndpointAdapter, PromptContext, Reply } from "../types.js";
@@ -32,12 +40,26 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Walk `err.cause` chain to find the first entry with a useful code/name. */
-function unwrapCause(err: unknown, depth = 0): { code?: string; name?: string; message?: string } {
+function unwrapCause(err: unknown, depth = 0): { code?: string; name?: string; message?: string; cause?: unknown } {
   if (!err || depth > 5) return {};
   const e = err as { code?: string; name?: string; message?: string; cause?: unknown };
-  if (e.code || e.name) return e;
+  if (e.code) return e;
+  if (e.name && e.name !== "Error" && e.name !== "TypeError" && e.name !== "FetchError") return e;
   return unwrapCause(e.cause, depth + 1);
 }
+
+/** Recognise undici's transport-failure wrapper even when its cause is opaque. */
+function isFetchFailedWrapper(err: unknown): boolean {
+  if (!err || typeof (err as { message?: unknown }).message !== "string") return false;
+  const msg = (err as { message: string }).message.trim();
+  const name = (err as { name?: string }).name;
+  return msg === "fetch failed" && (name === "TypeError" || name === "Error" || name === "FetchError" || name === undefined);
+}
+
+const RETRIABLE_NETWORK_CODES = new Set([
+  "ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "ENETUNREACH",
+  "ECONNREFUSED", "EPIPE", "EHOSTUNREACH", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
+]);
 
 export class PerplexityDeepResearchAdapter implements EndpointAdapter {
   readonly name = "perplexityDeepResearch";
@@ -96,6 +118,13 @@ export class PerplexityDeepResearchAdapter implements EndpointAdapter {
         clearTimeout(timer);
         const status = (err as { status?: number })?.status;
         if (status === 401 || status === 403) throw err; // never retry on auth
+        const inner = unwrapCause(err);
+        const retriable =
+          inner.name === "AbortError" ||
+          (inner.code !== undefined && RETRIABLE_NETWORK_CODES.has(inner.code)) ||
+          isFetchFailedWrapper(err) ||
+          isFetchFailedWrapper(inner);
+        if (!retriable) throw err;
         if (attempt === MAX_ATTEMPTS) break;
         await sleep(2_000);
       } finally {
@@ -104,9 +133,19 @@ export class PerplexityDeepResearchAdapter implements EndpointAdapter {
     }
 
     const inner = unwrapCause(lastErr);
-    const detail = inner.code || inner.name
-      ? `${(lastErr as Error)?.message ?? "fetch failed"} (${inner.code ?? inner.name})`
-      : (lastErr as Error)?.message ?? "fetch failed";
+    const innerTag = inner.code
+      ?? (inner.name && inner.name !== "Error" && inner.name !== "TypeError" && inner.name !== "FetchError" ? inner.name : null);
+    let detail: string;
+    if (innerTag) {
+      detail = `${(lastErr as Error)?.message ?? "fetch failed"} (${innerTag})`;
+    } else {
+      const causeMsg = (lastErr as { cause?: { message?: string } })?.cause?.message;
+      if (causeMsg && causeMsg.trim() !== "" && causeMsg.trim() !== "fetch failed") {
+        detail = `${(lastErr as Error)?.message ?? "fetch failed"} (cause: ${causeMsg})`;
+      } else {
+        detail = (lastErr as Error)?.message ?? "fetch failed";
+      }
+    }
     const err = new Error(`[perplexityDeepResearch] all retries exhausted: ${detail}`);
     (err as Error & { cause?: unknown }).cause = lastErr;
     throw err;

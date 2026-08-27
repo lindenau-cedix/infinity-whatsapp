@@ -240,3 +240,384 @@ test('perplexity: persistent ECONNRESET surfaces the underlying code in the erro
     }
   });
 });
+
+// INFA-24 follow-up: the original fix retried only when .cause had a known
+// .code. undici 22+ and several TLS/proxy races surface fetch-time failures
+// as `TypeError('fetch failed')` or even `Error('fetch failed')` with a
+// null or code-less .cause. The retry classifier now treats the wrapper
+// itself as retriable, so a single transient blip no longer kills the call.
+
+test('perplexity: "fetch failed" with no .cause at all is retried and recovers (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        // TLS race / proxy drop: undici throws TypeError("fetch failed")
+        // with .cause === undefined. Before the fix this aborted the call
+        // and surfaced "all retries exhausted: fetch failed".
+        throw new TypeError('fetch failed');
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-no-cause' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-no-cause/);
+      assert.equal(calls, 2, 'should have retried once after opaque fetch failed');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: "fetch failed" with cause carrying only .name is retried (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        // undici socket-shape: cause has .name but no .code. The previous
+        // classifier skipped past it (no .code), giving up on a retriable
+        // socket blip.
+        const cause = Object.assign(new Error('socket hang up'), { name: 'SocketError' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-name-only' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-name-only/);
+      assert.equal(calls, 2, 'should have retried once after name-only cause');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: persistent opaque "fetch failed" surfaces cause message in the error (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    global.fetch = async () => {
+      // undici-22+ plain-Error wrapper, no .code anywhere. We still want
+      // the operator to see *something* more informative than a bare
+      // "fetch failed" — surface the cause's message if available.
+      const cause = new Error('TLS handshake timeout after 30s');
+      throw Object.assign(new Error('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /TLS handshake timeout/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)),
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: persistent bare "fetch failed" with no cause still surfaces retriable status (INFA-24 follow-up)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      // Worst case: wrapper only, no cause, no code, no name. The wrapper
+      // ITSELF is the diagnostic. We retry per the new classifier and on
+      // exhaustion surface the wrapper message verbatim (the operator
+      // should know undici said "fetch failed").
+      throw new TypeError('fetch failed');
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        // INFA-24 deeper: the envelope now includes the host-connectivity
+        // hint because consecutive opaque failures look like a
+        // firewall/proxy problem, not a Perplexity outage.
+        (err) => /fetch failed/.test(String(err.message)) && /all retries exhausted/.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
+      );
+      // INFA-24 deeper: with the new opaqueBailAfter=2 default, deep-research
+      // bails after 2 consecutive fully-opaque failures instead of burning
+      // the full 4×300s ≈ 20min budget waiting for a signal that never
+      // comes. We still DO retry (it's not 1) so a single transient blip
+      // recovers normally.
+      assert.equal(calls, 2, 'opaque fetch failed should bail after 2 attempts with the host-connectivity hint');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research recovers on first attempt when wrapper has a code (INFA-24 deeper)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        // Has a code on the cause — NOT fully opaque. Should retry normally
+        // and recover; opaqueBailAfter must NOT trip here.
+        const cause = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-with-code' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-with-code/);
+      assert.equal(calls, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research bails early on persistent opaque failures with connectivity hint (INFA-24 deeper)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      // Persistent opaque failure — no cause, no code, no name.
+      throw new TypeError('fetch failed');
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /early bail/i.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
+      );
+      // Bail after opaqueBailAfter=2 consecutive opaque failures (NOT 4).
+      assert.equal(calls, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research bails early on persistent UND_ERR_SOCKET (visible transport-cluster)', async () => {
+  // INFA-24 widen: a visible transport-cluster error (UND_ERR_SOCKET) used
+  // to burn the full retry budget because the operator "could already see
+  // something" — the envelope just said `fetch failed (UND_ERR_SOCKET)`
+  // with no hint. After the widen, two consecutive hits trip the same
+  // early-bail + connectivity-hint envelope as a fully-opaque cluster,
+  // because in both flavors the operator has no actionable response.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      // undici: wrapper says "fetch failed", inner cause has .name='UND_ERR_SOCKET'
+      const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => /early bail/i.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
+      );
+      assert.equal(calls, 2, 'persistent visible transport-cluster should bail after 2 with the host-connectivity hint');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: deep-research recovers on first UND_ERR_SOCKET (transient socket drop)', async () => {
+  // INFA-24 widen sanity: a single visible transport-cluster hit followed
+  // by success MUST NOT trip the early-bail path. consecutiveUnreachable
+  // only reaches 1, well below opaqueBailAfter=2.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-from-socket' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /recovered-from-socket/);
+      assert.equal(calls, 2);
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: opaqueBailAfter option can disable early bail (INFA-24 deeper)', async () => {
+  // Drive the dispatcher directly via the shared module so we can pass
+  // opaqueBailAfter=Infinity and verify the legacy behaviour still works.
+  const { runWithRetry } = require('../dispatcher/shared.js');
+  let calls = 0;
+  const original = global.fetch;
+  global.fetch = async () => {
+    calls += 1;
+    throw new TypeError('fetch failed');
+  };
+  try {
+    await assert.rejects(
+      () => runWithRetry(() => fetch('https://example.test/x'), {
+        adapter: 'test',
+        attempts: 4,
+        timeoutMs: 100,
+        baseDelayMs: 1,
+        opaqueBailAfter: Infinity,
+      }),
+      (err) => /all retries exhausted/.test(String(err.message)) && !/early bail/i.test(String(err.message)),
+    );
+    assert.equal(calls, 4);
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test('probeEndpoint: reachable host returns reachable=true with status', async () => {
+  const { probeEndpoint } = require('../dispatcher/shared.js');
+  const original = global.fetch;
+  global.fetch = async () => ({ status: 401 });
+  try {
+    const r = await probeEndpoint('https://example.test');
+    assert.equal(r.reachable, true);
+    assert.equal(r.status, 401);
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test('probeEndpoint: unreachable host returns reachable=false with cause', async () => {
+  const { probeEndpoint } = require('../dispatcher/shared.js');
+  const original = global.fetch;
+  global.fetch = async () => {
+    const cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    throw Object.assign(new TypeError('fetch failed'), { cause });
+  };
+  try {
+    const r = await probeEndpoint('https://does-not-exist.test');
+    assert.equal(r.reachable, false);
+    assert.match(r.cause, /ECONNREFUSED/);
+  } finally {
+    global.fetch = original;
+  }
+});
+
+// INFA-24 widening: some Perplexity moderation refusals (e.g. for sensitive
+// pharmacology queries like DSIP) surface as `TypeError("fetch failed")`
+// with the HTTP status and body buried on `.cause.{status,body}`. Before
+// this widening the dispatcher classified those as fully-opaque transport
+// failures and showed the connectivity-hint envelope — wrong, since the
+// upstream had refused the query, the host was perfectly reachable. The
+// fix: unwrapCause() now surfaces a `.status` from the cause chain, the
+// retry classifier treats 4xx (except 408/429) as terminal, and the
+// envelope shows `fetch failed (HTTP 422) — <body>` instead of a generic
+// connectivity hint.
+
+test('perplexity: 422 moderation refusal wrapped in fetch-failed surfaces status + body (INFA-24 widening)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      // Mirror undici surfacing a half-streamed Perplexity moderation
+      // refusal: the upstream opens, sends HTTP 422, then aborts the body
+      // read. undici throws TypeError("fetch failed") with the real status
+      // and body on the cause.
+      const cause = Object.assign(
+        new Error('Failed to call moderation endpoint'),
+        {
+          status: 422,
+          body: JSON.stringify({ error: 'Failed to call moderation endpoint' }),
+        },
+      );
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('What is the pharmacological profile of DSIP?', {
+          model: 'sonar-deep-research',
+        }),
+        (err) => {
+          const msg = String(err.message);
+          // Envelope MUST surface the HTTP status, not just "fetch failed".
+          assert.ok(/HTTP 422/.test(msg), `expected "HTTP 422" in message, got: ${msg}`);
+          // Envelope MUST surface the moderation keyword so the operator
+          // can see the real reason without digging through logs.
+          assert.ok(/moderation/i.test(msg), `expected "moderation" in message, got: ${msg}`);
+          // 4xx (non-408/429) is per-query — must NOT retry.
+          assert.equal(calls, 1, `expected exactly 1 call (no retry on 422), got ${calls}`);
+          return true;
+        },
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: a plain 422 from upstream surfaces status + body without retry (INFA-24 widening)', async () => {
+  // Companion to the wrapper test above: same shape, but the response
+  // comes through cleanly (no abort mid-body). runWithRetry must still
+  // bail without retrying and surface the status + body.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const restore = fakeFetch({
+      [URL]: () => {
+        calls += 1;
+        return okJson({ error: 'Failed to call moderation endpoint' }, 422);
+      },
+    });
+    try {
+      await assert.rejects(
+        () => real.run('a', { model: 'sonar-deep-research' }),
+        (err) => {
+          const msg = String(err.message);
+          assert.ok(/422/.test(msg), `expected "422" in message, got: ${msg}`);
+          assert.ok(/moderation/i.test(msg), `expected "moderation" in message, got: ${msg}`);
+          return true;
+        },
+      );
+      assert.equal(calls, 1, '422 must not be retried');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: 429 wrapped in fetch-failed IS still retried (INFA-24 widening carve-out)', async () => {
+  // 429 is the canonical "rate limited, back off" code — it must remain
+  // retriable even when surfaced through a fetch-failed wrapper. The
+  // 4xx-not-retriable rule applies to "the request itself was refused",
+  // not to rate-limit retries.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    let calls = 0;
+    const original = global.fetch;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls < 2) {
+        const cause = Object.assign(new Error('rate limited'), { status: 429 });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'recovered-after-429' } }] });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      const text = await real.run('a', { model: 'sonar-reasoning-pro' });
+      assert.match(text, /recovered-after-429/);
+      assert.equal(calls, 2, '429 must still retry after a fetch-failed wrapper');
+    } finally {
+      restore();
+    }
+  });
+});
