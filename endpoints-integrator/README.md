@@ -26,6 +26,7 @@ infinity/
   dispatcher/             # runnable JS adapters; Qwen CLI lives here
     index.js
     qwen.js               # local CLI; no API key, no HTTP
+    qwenMedia.js          # INFA-27: media analyser; CLI w/ media path
     perplexity.js
     firecrawl.js
     shared.js             # envKey, runWithRetry, trimForReply
@@ -123,6 +124,50 @@ directly. See `docs/credential-vault.md` for the full vault contract.
 - Media is referenced by server-side path. We do not base64-inject.
 - Adapters return `AuthError` (with the missing key name) on bad creds —
   they do not silently retry.
+
+## Media attachments — Qwen image/video analyser (INFA-27)
+
+When the WhatsApp client delivers an image or video, the media store
+(`infinity-media`) persists it under `./media/images/` or `./media/videos/`
+and forwards the absolute path on `ctx.mediaPaths`. The plain text Qwen
+dispatcher ignores those paths, so `register.js` routes any non-empty
+`mediaPaths` through a sibling adapter (`dispatcher/qwenMedia.js`) that
+shells out to the same `qwen` CLI with the spec-mandated prompt:
+
+```
+qwen -m qwen3:30b-a3b -p "Analyse this media: [PATH TO MEDIA SOURCE]"
+```
+
+Behaviour:
+
+- `mediaPaths` non-empty + `qwenCode` adapter → analyser path runs, plain
+  text adapter never sees the message.
+- `mediaPaths` empty or missing → falls back to the existing text-only
+  `dispatch(qwenKey, prompt, ctx)` path.
+- Non-Qwen endpoints (`perplexityReasoning` / `perplexityDeepResearch` /
+  `firecrawl`) are never routed to the analyser — each has its own media
+  story (or none).
+- Voice attachments are already transcribed upstream by
+  `infinity-media/preprocessMessage`, so `mediaPaths` at the dispatcher
+  holds the original `.ogg` file but the analyser branch treats it as
+  one slot and discards it; voice messages therefore fall through to the
+  text path with the Whisper transcript as the prompt (the existing
+  behaviour — `Antworte sprachlich` style overrides remain in force).
+
+The branch decision is exposed as `shouldRouteToMediaAnalyser(name, prompt, ctx)`
+in `register.js` so future adapter wiring has a single switch to consult.
+
+Tunables (env vars, all optional, same as the plain text path):
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `QWEN_BIN` | `qwen` | Path to the `qwen` CLI on PATH. |
+| `QWEN_MODEL` | `qwen3:30b-a3b` | Model name passed via `-m`. |
+| `ctx.qwenBin` / `ctx.qwenModel` | — | Per-call overrides (also honoured). |
+
+The analyser's retry envelope is the same `runWithRetry(...)` helper used
+by `dispatcher/qwen.js` — 2 attempts, 200 ms base backoff, 120 s per-attempt
+deadline (vision analyse can legitimately take longer than chat text).
 
 ## Voice-out ("Antworte sprachlich")
 

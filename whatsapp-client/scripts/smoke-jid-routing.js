@@ -211,3 +211,68 @@ test('validateConfiguredJids emits ok summary when every configured JID matches'
 
   try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
 });
+
+// INFA-27 hardening — unparseable inbound payloads (notification /
+// protocol-level messages that lack a populated id) must be dropped at
+// info level, not surfaced as `wa.message.failed` with `error="r"`.
+// We exercise the actual `client.on('message', …)` wiring by giving the
+// adapter a fake client whose listener we invoke directly.
+test('messages with no id, body, or media emit wa.message.ignored_unparseable and never reach the router', async () => {
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  // Re-run attachMessageStream so it binds to our fake client.
+  adapter['attachMessageStream']();
+
+  const routed = [];
+  adapter.onMessage((m) => { routed.push(m); });
+
+  await withCapture(async () => {
+    // wwebjs sometimes hands us a payload with no id, no body, no media.
+    assert.doesNotThrow(() => messageHandler({
+      from: 'real-qwen@g.us',
+      hasMedia: false,
+      type: 'notification',
+    }));
+    // And one without a `from` JID.
+    assert.doesNotThrow(() => messageHandler({
+      id: { id: 'x', _serialized: 'x' },
+      hasMedia: false,
+      type: 'chat',
+    }));
+    // A routable message still works after the ignored ones.
+    assert.doesNotThrow(() => messageHandler({
+      id: { id: 'ok', _serialized: 'ok' },
+      from: 'real-qwen@g.us',
+      author: 'author@c.us',
+      body: 'hi qwen',
+      hasMedia: false,
+      type: 'chat',
+    }));
+  });
+
+  const unparseable = entriesMatching((e) => e.msg === 'wa.message.ignored_unparseable');
+  assert.equal(unparseable.length, 2, 'two unparseable payloads should be ignored');
+  assert.equal(unparseable[0].level, 'info');
+  assert.equal(unparseable[0].hasId, false);
+  assert.equal(unparseable[0].hasBody, false);
+  assert.equal(unparseable[1].from, null);
+
+  // None of the ignored payloads must reach the router, but the routable
+  // one does.
+  assert.equal(routed.length, 1, 'only the routable payload should reach handlers');
+  assert.equal(routed[0].text, 'hi qwen');
+
+  // Critically: there should be NO `wa.message.failed` line for the
+  // unparseable ones (the old symptom that masked real routing).
+  const failed = entriesMatching((e) => e.msg === 'wa.message.failed' && e.error === 'r');
+  assert.equal(failed.length, 0, 'unparseable payloads must not produce wa.message.failed');
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});

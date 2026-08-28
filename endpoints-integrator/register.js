@@ -41,6 +41,7 @@
 'use strict';
 
 const { dispatch } = require('./dispatcher/index.js');
+const qwenMedia = require('./dispatcher/qwenMedia.js');
 
 /**
  * Maps the WhatsApp-side endpoint name (camelCase, declared in
@@ -69,12 +70,37 @@ class InvalidEndpointError extends Error {
 }
 
 /**
+ * INFA-27 — Qwen media analyser branch. When the WhatsApp dispatcher hands
+ * us a non-empty `ctx.mediaPaths` the WA client has already persisted the
+ * inbound image / video attachments and wants Qwen to analyse them. The
+ * text-only Qwen dispatcher would drop those paths on the floor, so we
+ * route the call through `dispatcher/qwenMedia.js` instead, which shells
+ * out:
+ *
+ *   qwen -m qwen3:30b-a3b -p "Analyse this media: [PATH TO MEDIA SOURCE]"
+ *
+ * Per the issue spec. Voice attachments are excluded by the WA client
+ * (the Voice & Media Engineer transcribes them before we get here), so
+ * what reaches this branch is always an image or video. We keep the rule
+ * cheap — `mediaPaths.length > 0` — because a multi-image gallery send
+ * produces an array of any kind and we want the analyser to run on every
+ * such send, not to second-guess the MIME allowlist (that's the media
+ * store's job upstream).
+ */
+function shouldRouteToMediaAnalyser(name, prompt, ctx) {
+  if (name !== 'qwenCode') return false;
+  const paths = ctx && Array.isArray(ctx.mediaPaths) ? ctx.mediaPaths : [];
+  return paths.length > 0;
+}
+
+/**
  * Wrap a string-returning dispatch() into the IntegratorAdapter shape the
  * WhatsApp dispatcher consumes. The WhatsApp side passes through `ctx` as-is
  * — for the JS dispatcher that means requestId is forwarded (it already is
  * via `dispatch()`), group is forwarded (the dispatcher ignores it, only
  * used for logging), and mediaPaths is forwarded (all current JS adapters
- * ignore it; only the future TypeScript Qwen adapter will consume it).
+ * ignore it; the Qwen adapter delegates to `qwenMedia` when the WA client
+ * attaches media — INFA-27).
  */
 function wrap(name) {
   const dispatchKey = NAME_TO_DISPATCH_KEY[name];
@@ -84,7 +110,21 @@ function wrap(name) {
     name,
     async run(prompt, ctx = {}) {
       const startedAt = Date.now();
-      const text = await dispatch(dispatchKey, prompt, ctx);
+      let text;
+      if (shouldRouteToMediaAnalyser(name, prompt, ctx)) {
+        // INFA-27: media analyser branch. The user's caption (if any) is
+        // surfaced via `prompt` — not the media path itself — so Qwen can
+        // see both "what the user said" and "where the file lives". The
+        // analyser composes the CLI prompt around the path, not the body.
+        const mergedCtx = {
+          ...ctx,
+          qwenBin: ctx.qwenBin || process.env.QWEN_BIN,
+          qwenModel: ctx.qwenModel || process.env.QWEN_MODEL,
+        };
+        text = await qwenMedia.run(ctx.mediaPaths, mergedCtx);
+      } else {
+        text = await dispatch(dispatchKey, prompt, ctx);
+      }
       return {
         text,
         mediaRefs: [], // text-only by contract; Firecrawl returns markdown inline
@@ -123,6 +163,7 @@ registerIntegratorAdapters(globalThis);
 module.exports = {
   adapterFactory,
   registerIntegratorAdapters,
+  shouldRouteToMediaAnalyser,
   // Re-exported for unit tests / smoke scripts.
   NAME_TO_DISPATCH_KEY,
   SUPPORTED_NAMES,

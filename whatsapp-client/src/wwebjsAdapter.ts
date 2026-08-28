@@ -305,6 +305,24 @@ export class WWebJsAdapter implements WhatsAppAdapter {
       const msg = raw as WWebJsMessage;
       // Skip our own outgoing messages and protocol-level chatter.
       if (msg.fromMe) return;
+      // whatsapp-web.js occasionally hands the adapter a notification or
+      // protocol-level payload (typing indicator, poll vote, ephemeral ack,
+      // or a message whose store entry is still being hydrated). Those
+      // payloads lack a populated `id` or a recognisable `from`, so route()
+      // would dereference `msg.id._serialized` and throw a TypeError that
+      // wwebjs swallows and re-throws as the literal string `"r"`. We
+      // classify those as ignorable at info level — the previous
+      // `wa.message.failed error="r"` line looked like a routing defect
+      // and was an INFA-27 follow-up investigation. INFA-27 hardening.
+      if (!isRoutable(msg)) {
+        this.log.info("wa.message.ignored_unparseable", {
+          from: typeof msg.from === "string" ? msg.from : null,
+          type: typeof msg.type === "string" ? msg.type : null,
+          hasId: Boolean(msg.id && typeof msg.id._serialized === "string"),
+          hasBody: typeof msg.body === "string",
+        });
+        return;
+      }
       this.route(msg).catch((err) => {
         this.log.error("wa.message.failed", {
           id: msg.id?._serialized,
@@ -316,6 +334,12 @@ export class WWebJsAdapter implements WhatsAppAdapter {
   }
 
   private async route(msg: WWebJsMessage): Promise<void> {
+    // Defense in depth: if a routable-looking msg (per isRoutable) still
+    // ends up here without an id, synthesize a fallback so downstream code
+    // that reads msg.id._serialized does not throw. INFA-27 hardening.
+    if (!msg.id || typeof msg.id._serialized !== "string") {
+      msg.id = { id: "unknown", _serialized: "unknown" };
+    }
     const chatJid = msg.from;
     const group = findGroupByJid(chatJid, this.groups);
     if (!group) {
@@ -416,4 +440,16 @@ function errorMsg(err: unknown): string {
 
 function asError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
+}
+
+// A message is "routable" if we can read the JID we route on, the
+// serialized id downstream code logs on, and either a body or media to
+// process. Anything else is a notification / protocol-level payload that
+// wwebjs occasionally delivers and we should drop quietly. INFA-27.
+function isRoutable(msg: WWebJsMessage): boolean {
+  if (!msg || typeof msg !== "object") return false;
+  if (typeof msg.from !== "string" || msg.from.length === 0) return false;
+  if (!msg.id || typeof msg.id._serialized !== "string") return false;
+  if (typeof msg.body !== "string" && !msg.hasMedia) return false;
+  return true;
 }

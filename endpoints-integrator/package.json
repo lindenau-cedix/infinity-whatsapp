@@ -6,7 +6,7 @@
   "type": "commonjs",
   "main": "dispatcher/index.js",
   "scripts": {
-    "test": "node --test test/qwen.test.js test/perplexity.test.js test/firecrawl.test.js test/dispatch.test.js",
+    "test": "node --test test/qwen.test.js test/qwenMedia.test.js test/perplexity.test.js test/firecrawl.test.js test/dispatch.test.js",
     "test:qwen": "node --test test/qwen.test.js",
     "test:perplexity": "node --test test/perplexity.test.js",
     "test:firecrawl": "node --test test/firecrawl.test.js",
