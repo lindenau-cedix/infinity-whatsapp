@@ -78,6 +78,24 @@ export class WWebJsAdapter implements WhatsAppAdapter {
           "--disable-dev-shm-usage",
         ],
       },
+      // whatsapp-web.js@1.23.0 ships a `LocalWebCache` whose `persist()`
+      // does `indexHtml.match(/manifest-([\d\\.]+)\.json/)[1]` with no
+      // null check. As of late August 2026 WhatsApp's served
+      // https://web.whatsapp.com/ no longer contains a `manifest-X.Y.Z.json`
+      // reference, so the regex returns null and the persist path throws
+      // `TypeError: Cannot read properties of null (reading '1')` during
+      // client.initialize(), which kills the whole adapter before it ever
+      // reaches the QR / message-stream code path.
+      //
+      // The cache itself is only an optimization: when it returns `null`
+      // from `resolve()`, `Client.js` re-fetches the live `index.html`
+      // from WhatsApp on every startup. Disabling the cache via
+      // `type: "none"` makes `persist()` a no-op (the base `WebCache`
+      // implementation), which is exactly what we want until the
+      // upstream library is fixed. INFA-27 boot crash workaround.
+      webVersionCache: {
+        type: "none",
+      },
     });
     this.wireLifecycle();
   }
