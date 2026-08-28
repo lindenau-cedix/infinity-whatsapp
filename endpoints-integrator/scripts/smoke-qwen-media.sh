@@ -28,7 +28,7 @@ MEDIA_PATH="$1"
 # real spawn/retry/argv code path, not just the prompt string.
 QWEN_BIN="${QWEN_BIN}" QWEN_MODEL="${QWEN_MODEL}" node -e '
   const path = require("node:path");
-  const { run } = require(path.resolve(__dirname, "..", "dispatcher", "qwenMedia.js"));
+  const { run } = require(path.resolve(__dirname, "dispatcher", "qwenMedia.js"));
   const target = process.argv[1];
   run([target], {}).then(
     (t) => { process.stdout.write(t); process.exit(0); },
