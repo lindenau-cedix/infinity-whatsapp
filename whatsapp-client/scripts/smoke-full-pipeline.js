@@ -303,3 +303,137 @@ test('photo with MessageMedia whose data is undefined does NOT crash route()', a
 
   try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
 });
+
+test('image-only message (no body, real persisted media) reaches the dispatcher with a media prompt', async () => {
+  // INFA-27 follow-up regression: an operator sending a bare image with no
+  // caption used to land at the dispatcher with msg.text="" which made the
+  // Integrator throw `dispatch: prompt must be a non-empty string` and the
+  // operator saw "Fehler bei qwenCode: ..." in WhatsApp. The fix builds a
+  // fallback prompt "Analyse this media: [PATH]" from the saved paths, so
+  // the qwen analyser dispatch chain has a non-empty prompt to invoke.
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  // Real-shape media store: persist returns the absolute path that the
+  // MediaStore contract promises. The dispatcher must hand that exact
+  // path to the adapter inside the fallback prompt.
+  const realMedia = {
+    init: async () => {},
+    persist: async (transportId, index, _att, kind) => ({
+      path: `/tmp/inbox/${transportId}-${index}.jpg`,
+      mime: 'image/jpeg',
+      kind,
+    }),
+  };
+  const freshAdapter = new WWebJsAdapter(groups, runtime, realMedia);
+
+  let capturedPrompt = null;
+  let capturedMediaPaths = null;
+  const sent = [];
+  freshAdapter.sendReply = async (jid, reply) => {
+    sent.push({ jid, text: reply.text });
+  };
+
+  const factory = () => ({
+    name: 'qwenCode',
+    run: async (text, ctx) => {
+      capturedPrompt = text;
+      capturedMediaPaths = ctx.mediaPaths;
+      return { text: `analyzed:${text}`, mediaRefs: [] };
+    },
+  });
+
+  const dispatcher = new Dispatcher(freshAdapter, factory, new Logger('test', 'info'));
+  dispatcher.bind();
+
+  let messageHandler = null;
+  freshAdapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  freshAdapter.attachMessageStream();
+
+  await new Promise((resolve) => {
+    messageHandler({
+      id: { id: 'img.001', _serialized: 'img.001' },
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      body: '',
+      hasMedia: true,
+      downloadMedia: () => Promise.resolve({ data: 'AAAA', mimetype: 'image/jpeg', filename: 'pic.jpg' }),
+      type: 'image',
+    });
+    setTimeout(resolve, 200);
+  });
+
+  assert.equal(sent.length, 1, 'image-only message must reach the dispatcher');
+  assert.ok(capturedPrompt, 'the adapter must have been called');
+  assert.ok(
+    capturedPrompt.startsWith('Analyse this media:'),
+    `prompt must be a media-analysis prompt, got: ${capturedPrompt}`,
+  );
+  assert.ok(
+    capturedPrompt.includes('/tmp/inbox/img.001-0.jpg'),
+    `prompt must reference the persisted media path, got: ${capturedPrompt}`,
+  );
+  assert.deepEqual(capturedMediaPaths, ['/tmp/inbox/img.001-0.jpg']);
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});
+
+test('image-only message: empty text + empty media does not pass an empty prompt', async () => {
+  // Belt-and-braces: if for any reason both text and media arrays end up
+  // empty by the time the dispatcher runs (a future regression), we must
+  // not pass an empty string to the Integrator (which would still reject
+  // with the same "prompt must be a non-empty string" error). The fix
+  // substitutes a clear placeholder instead.
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  let capturedPrompt = null;
+  adapter.sendReply = async () => {};
+
+  const factory = () => ({
+    name: 'qwenCode',
+    run: async (text) => {
+      capturedPrompt = text;
+      return { text: `echo:${text}`, mediaRefs: [] };
+    },
+  });
+
+  const dispatcher = new Dispatcher(adapter, factory, new Logger('test', 'info'));
+  dispatcher.bind();
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  adapter.attachMessageStream();
+
+  // Synthesize a message that passes isRoutable (hasMedia=true) but
+  // collectAttachments returns [] (downloadMedia resolves to undefined).
+  // text is also empty. This used to crash at the Integrator boundary.
+  await new Promise((resolve) => {
+    messageHandler({
+      id: { id: 'img.002', _serialized: 'img.002' },
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      body: '',
+      hasMedia: true,
+      downloadMedia: () => Promise.resolve(undefined),
+      type: 'image',
+    });
+    setTimeout(resolve, 200);
+  });
+
+  assert.ok(capturedPrompt !== null, 'adapter.run must have been called');
+  assert.ok(
+    capturedPrompt.length > 0,
+    `adapter.run must not receive an empty prompt, got: "${capturedPrompt}"`,
+  );
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});

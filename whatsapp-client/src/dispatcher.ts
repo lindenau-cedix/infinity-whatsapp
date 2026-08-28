@@ -73,10 +73,11 @@ export class Dispatcher {
 
   private async handle(msg: IngressMessage): Promise<void> {
     const requestId = crypto.randomUUID();
+    const mediaPaths = msg.media.map((m) => m.path);
     const ctx: IntegratorContext = {
       requestId,
       group: msg.group.label,
-      mediaPaths: msg.media.map((m) => m.path),
+      mediaPaths,
     };
 
     this.log.info("dispatch.received", {
@@ -90,9 +91,24 @@ export class Dispatcher {
     });
 
     const adapter = this.getAdapter(msg.group.endpoint);
+    // Image / video messages frequently arrive with no body at all (the
+    // caption field on whatsapp-web.js is *not* the same as `body`). The
+    // Integrator's `dispatch()` rejects empty prompts outright, which used
+    // to surface as "Fehler bei qwenCode: dispatch: prompt must be a
+    // non-empty string" the moment a user sent a bare photo. INFA-27
+    // follow-up: when the body is empty but media is present, build the
+    // analysis prompt from the saved paths so the qwen analyser still has
+    // something non-empty to invoke against — matching the INFA-27 spec
+    // ("Analyse this media: [PATH TO MEDIA SOURCE]"). If both body and
+    // media are empty we emit a clear operator-visible reply rather than
+    // surfacing a generic Integrator error.
+    const prompt =
+      msg.text.length > 0
+        ? msg.text
+        : buildMediaPrompt(mediaPaths) || "(empty message — no body or media)";
     let reply: IntegratorReply;
     try {
-      reply = await adapter.run(msg.text, ctx);
+      reply = await adapter.run(prompt, ctx);
     } catch (err) {
       const text = `⚠️ Fehler bei ${adapter.name}: ${
         err instanceof Error ? err.message : String(err)
@@ -122,4 +138,20 @@ export class Dispatcher {
 
     await this.adapter.sendReply(msg.group.jid, egress);
   }
+}
+
+/**
+ * Build a non-empty prompt for the Integrator when the inbound body is
+ * empty but the message carried persisted attachments. The shape mirrors
+ * the INFA-27 spec ("Analyse this media: [PATH TO MEDIA SOURCE]") and
+ * keeps the qwen analyser dispatch chain from rejecting with
+ * `prompt must be a non-empty string`. INFA-27 follow-up.
+ */
+function buildMediaPrompt(mediaPaths: string[]): string {
+  if (mediaPaths.length === 0) return "";
+  if (mediaPaths.length === 1) {
+    return `Analyse this media: ${mediaPaths[0]}`;
+  }
+  return `Analyse this media (${mediaPaths.length} attachments):\n` +
+    mediaPaths.map((p) => `- ${p}`).join("\n");
 }
