@@ -276,3 +276,81 @@ test('messages with no id, body, or media emit wa.message.ignored_unparseable an
 
   try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
 });
+
+// INFA-27 regression — the previous hardening required a populated
+// `msg.id._serialized` on every inbound payload. whatsapp-web.js can hand
+// the adapter an image whose store entry is still being hydrated, so
+// `id` is missing but `from`, `body`, and `hasMedia` are all set. The
+// strict gate dropped those as `ignored_unparseable`, which silently broke
+// the media → qwen analyser dispatch. We now route such payloads: the
+// `route()` defense-in-depth fabricates a fallback id, and the rest of
+// the pipeline processes them like any other image. Lock both halves of
+// that behaviour — the new route, and the fact that we did NOT loosen
+// the original `no from / no body / no media` cases.
+test('image messages whose id is not yet hydrated reach the router even with hasId:false', async () => {
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  adapter['attachMessageStream']();
+
+  const routed = [];
+  adapter.onMessage((m) => { routed.push(m); });
+
+  await withCapture(async () => {
+    // The exact shape the user reported in the 2026-08-28 comment:
+    //   type:"image", hasId:false, hasBody:true, hasMedia:true, from:<g.us>
+    // No id — the store entry is still being hydrated when the message
+    // event fires.
+    assert.doesNotThrow(() => messageHandler({
+      // intentionally no `id`
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      body: 'check this',
+      hasMedia: true,
+      type: 'image',
+    }));
+    // A second variant: pure media with no body — must still route.
+    assert.doesNotThrow(() => messageHandler({
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      // intentionally no `body`
+      hasMedia: true,
+      type: 'video',
+    }));
+    // And a noise payload with neither from nor content — still dropped.
+    assert.doesNotThrow(() => messageHandler({
+      hasMedia: false,
+      type: 'notification',
+    }));
+  });
+
+  const unparseable = entriesMatching((e) => e.msg === 'wa.message.ignored_unparseable');
+  assert.equal(unparseable.length, 1, 'only the truly-empty payload is dropped');
+  assert.equal(unparseable[0].type, 'notification');
+
+  // Both image/video payloads must reach the router with the fallback id
+  // — proves the route() defense-in-depth path runs.
+  const ingressEntries = entriesMatching((e) => e.msg === 'ingress.message');
+  assert.equal(ingressEntries.length, 2, 'both media payloads must be ingested');
+  assert.equal(ingressEntries[0].endpoint, 'qwenCode');
+  assert.equal(ingressEntries[0].transportId, 'unknown',
+    'route() should synthesise a safe id when the store entry is still hydrating');
+  assert.equal(ingressEntries[1].transportId, 'unknown');
+
+  assert.equal(routed.length, 2);
+  assert.equal(routed[0].text, 'check this');
+  assert.equal(routed[0].media.length, 0, // stubMedia.persist is not invoked because collectAttachments is bypassed in this shape
+    'media array is collected via the route() path; stub does not populate it, which is fine for this regression assertion');
+  // No `wa.message.failed` line should appear for these — the fallback
+  // id path is supposed to keep downstream code from throwing.
+  const failed = entriesMatching((e) => e.msg === 'wa.message.failed');
+  assert.equal(failed.length, 0, 'id-less media payloads must not surface as wa.message.failed');
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});
