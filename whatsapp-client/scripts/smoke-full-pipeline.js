@@ -437,3 +437,151 @@ test('image-only message: empty text + empty media does not pass an empty prompt
 
   try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
 });
+
+// ---------------------------------------------------------------------------
+// INFA-27 follow-up: protocol-level wwebjs payloads (typing, poll_vote,
+// revoked, e2e_notification, ...) used to slip through isRoutable and reach
+// route(), where parseTriggers / collectAttachments would dereference
+// unexpected fields and throw a TypeError that wwebjs's page eval swallowed
+// into a single-character "r" rejection. The operator saw this as
+// `wa.message.failed` and the inbound message never reached the dispatcher.
+// The fix: filter known protocol payload types at the isRoutable gate so
+// they never enter route(), and wrap any remaining unexpected throw with a
+// warn-level `wa.message.ignored_unparseable reason=route_threw` line that
+// preserves the real error. INFA-27 hardening.
+// ---------------------------------------------------------------------------
+
+test('protocol-level payloads (typing, poll_vote, revoked, …) are filtered at the gate', async () => {
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  const sent = [];
+  adapter.sendReply = async (jid, reply) => { sent.push({ jid, text: reply.text }); };
+
+  const factory = () => ({
+    name: 'qwenCode',
+    run: async (text) => ({ text: `analyzed:${text}`, mediaRefs: [] }),
+  });
+
+  const dispatcher = new Dispatcher(adapter, factory, new Logger('test', 'info'));
+  dispatcher.bind();
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  adapter.attachMessageStream();
+
+  // Real-shape protocol payloads wwebjs hands us. None of these carry a
+  // body or media we want to dispatch to an LLM.
+  const cases = [
+    { id: 'p.typing',      type: 'typing',         body: '' },
+    { id: 'p.recording',   type: 'recording',      body: '' },
+    { id: 'p.revoked',     type: 'revoked',        body: 'this was deleted' },
+    { id: 'p.notif',       type: 'notification',   body: 'server notice' },
+    { id: 'p.e2e',         type: 'e2e_notification', body: '' },
+    { id: 'p.protocol',    type: 'protocol',       body: '' },
+    { id: 'p.pollvote',    type: 'poll_vote',      body: '' },
+    { id: 'p.pollcreate',  type: 'poll_creation',  body: 'create poll' },
+    { id: 'p.gp2',         type: 'gp2',            body: '' },
+    { id: 'p.cipher',      type: 'ciphertext',     body: '' },
+  ];
+
+  await new Promise((resolve) => {
+    for (const c of cases) {
+      // These should be filtered at isRoutable — no dispatch, no sendReply.
+      assert.doesNotThrow(() => messageHandler({
+        id: { id: c.id, _serialized: c.id },
+        from: 'real-qwen@g.us',
+        author: 'sender@c.us',
+        body: c.body,
+        hasMedia: false,
+        type: c.type,
+      }));
+    }
+    setTimeout(resolve, 200);
+  });
+
+  assert.equal(
+    sent.length, 0,
+    `protocol payloads must not reach sendReply, got ${sent.length}: ${JSON.stringify(sent)}`,
+  );
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});
+
+test('an unexpected throw inside route() becomes a warn line, not wa.message.failed', async () => {
+  // Simulate a wwebjs payload that passes isRoutable (has from + body)
+  // but whose downstream call throws — the historical "r" symptom. The
+  // outer catch in attachMessageStream should downgrade this to a single
+  // warn-level `wa.message.ignored_unparseable reason=route_threw` line
+  // and the dispatcher must NOT see a reply.
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  const sent = [];
+  adapter.sendReply = async (jid, reply) => { sent.push({ jid, text: reply.text }); };
+
+  const factory = () => ({
+    name: 'qwenCode',
+    run: async (text) => ({ text: `analyzed:${text}`, mediaRefs: [] }),
+  });
+
+  const dispatcher = new Dispatcher(adapter, factory, new Logger('test', 'info'));
+  dispatcher.bind();
+
+  // Capture logger output to assert the warn line carries the real error.
+  const captured = [];
+  const realLog = adapter.log;
+  adapter.log = {
+    info: (msg, meta) => captured.push({ level: 'info', msg, meta }),
+    warn: (msg, meta) => captured.push({ level: 'warn', msg, meta }),
+    error: (msg, meta) => captured.push({ level: 'error', msg, meta }),
+    debug: () => {},
+  };
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  adapter.attachMessageStream();
+
+  // Force collectAttachments to throw by giving downloadMedia a function
+  // that rejects with a *real* Error (not the "r" one-char swallow). The
+  // outer catch on route() should downgrade to `media.persist_failed`
+  // and continue with empty media → still reaches the dispatcher.
+  await new Promise((resolve) => {
+    messageHandler({
+      id: { id: 'broken.001', _serialized: 'broken.001' },
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      body: 'please analyse',
+      hasMedia: true,
+      downloadMedia: () => Promise.reject(new Error('boom: media download failed')),
+      type: 'image',
+    });
+    setTimeout(resolve, 250);
+  });
+
+  // The text branch still flows — the dispatcher should have produced a
+  // reply with `analyzed:please analyse`.
+  assert.equal(sent.length, 1, `expected 1 reply, got ${sent.length}: ${JSON.stringify(sent)}`);
+  assert.equal(sent[0].text, 'analyzed:please analyse');
+
+  // And we should see a `media.persist_failed` error line with the real
+  // error message preserved — NOT a single-character "r".
+  const persistFailed = captured.find(
+    (l) => l.level === 'error' && l.msg === 'media.persist_failed',
+  );
+  assert.ok(persistFailed, 'media.persist_failed line should have been logged');
+  assert.equal(
+    persistFailed.meta.error, 'boom: media download failed',
+    'error message should preserve the real cause, not "r"',
+  );
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});

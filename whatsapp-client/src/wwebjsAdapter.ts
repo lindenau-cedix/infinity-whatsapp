@@ -326,14 +326,28 @@ export class WWebJsAdapter implements WhatsAppAdapter {
           hasId: Boolean(msg.id && typeof msg.id._serialized === "string"),
           hasBody: typeof msg.body === "string",
           hasMedia: typeof msg.hasMedia === "boolean" ? msg.hasMedia : null,
+          reason: routableRejectReason(msg),
         });
         return;
       }
+      // Anything that survives isRoutable but still throws inside route()
+      // (e.g. a malformed wwebjs payload whose `from` JID is fine but whose
+      // body / author / media handle is unexpected) used to surface as
+      // `wa.message.failed error:"r"` because wwebjs swallows the original
+      // TypeError into a single-character rejection. Wrap the whole route()
+      // so an unexpected shape becomes a single warn line carrying the
+      // real error message and shape snapshot, not a red herring.
       this.route(msg).catch((err) => {
-        this.log.error("wa.message.failed", {
-          id: msg.id?._serialized,
-          from: msg.from,
+        this.log.warn("wa.message.ignored_unparseable", {
+          from: typeof msg.from === "string" ? msg.from : null,
+          type: typeof msg.type === "string" ? msg.type : null,
+          hasId: Boolean(msg.id && typeof msg.id._serialized === "string"),
+          hasBody: typeof msg.body === "string",
+          hasMedia: typeof msg.hasMedia === "boolean" ? msg.hasMedia : null,
+          reason: "route_threw",
           error: errorMsg(err),
+          errorName: err instanceof Error ? err.name : typeof err,
+          errorStack: err instanceof Error ? (err.stack ?? null) : null,
         });
       });
     });
@@ -358,14 +372,15 @@ export class WWebJsAdapter implements WhatsAppAdapter {
       // double-check their .env. INFA-20.
       this.log.info("wa.message.ignored_no_group", {
         from: chatJid,
-        author: msg.author,
+        author: typeof msg.author === "string" ? msg.author : null,
         configuredJids: Object.values(this.groups).map((g) => g.jid),
-        bodyBytes: (msg.body ?? "").length,
+        bodyBytes: (typeof msg.body === "string" ? msg.body : "").length,
       });
       return;
     }
 
-    const { text, voiceReply, grillMe } = parseTriggers(msg.body ?? "");
+    const bodyText = typeof msg.body === "string" ? msg.body : "";
+    const { text, voiceReply, grillMe } = parseTriggers(bodyText);
     // Guard media collection so a single bad attachment does not abort
     // the whole message — we still want the text branch (if any) to be
     // delivered. The pre-2026-08-28 behavior was: collectAttachments
@@ -389,7 +404,7 @@ export class WWebJsAdapter implements WhatsAppAdapter {
     const ingress: IngressMessage = {
       transportId: msg.id._serialized,
       group,
-      authorId: msg.author ?? chatJid,
+      authorId: typeof msg.author === "string" ? msg.author : chatJid,
       text,
       media,
       voiceReply,
@@ -495,12 +510,53 @@ function asError(err: unknown): Error {
 // We do not require a populated `msg.id._serialized` — image / video
 // payloads can arrive before their store entry is hydrated, and the
 // route() function synthesises a safe fallback id for downstream code.
-// Anything that fails this check is a notification / protocol-level payload
-// (typing indicator, poll vote, ephemeral ack, etc.) and we drop it at
-// info level. INFA-27 hardening.
+//
+// We additionally filter known protocol-level / non-content message types
+// that wwebjs hands us without an actionable body or media:
+//   - "typing" / "recording"   — presence indicators
+//   - "revoked"                — a deleted-for-everyone message
+//   - "notification"           — generic server-pushed notice
+//   - "e2e_notification"       — encryption handshake / sync notice
+//   - "protocol"               — raw protocol ack
+//   - "poll_vote" / "poll_creation" — WhatsApp poll events (no text body
+//     we want to forward to an LLM; poll_vote messages never carry one)
+//   - "gp2"                    — group protocol (member add/remove/promote)
+//   - "ciphertext"             — undecryptable stub before keys sync
+// Filtering these at the gate stops them reaching route() at all, so the
+// "r" TypeError noise (wwebjs swallows the real cause) stops appearing as
+// `wa.message.failed`. INFA-27 follow-up hardening.
+const NON_ROUTABLE_TYPES: ReadonlySet<string> = new Set([
+  "typing",
+  "recording",
+  "revoked",
+  "notification",
+  "e2e_notification",
+  "protocol",
+  "poll_vote",
+  "poll_creation",
+  "gp2",
+  "ciphertext",
+]);
+
 function isRoutable(msg: WWebJsMessage): boolean {
   if (!msg || typeof msg !== "object") return false;
   if (typeof msg.from !== "string" || msg.from.length === 0) return false;
   if (typeof msg.body !== "string" && !msg.hasMedia) return false;
+  if (typeof msg.type === "string" && NON_ROUTABLE_TYPES.has(msg.type)) return false;
   return true;
+}
+
+/**
+ * Operator-readable reason the message was filtered. Kept as a separate
+ * helper so the `wa.message.ignored_unparseable` log line tells the
+ * operator *why* a payload was dropped, not just that it was.
+ */
+function routableRejectReason(msg: WWebJsMessage): string {
+  if (!msg || typeof msg !== "object") return "not_an_object";
+  if (typeof msg.from !== "string" || msg.from.length === 0) return "missing_from_jid";
+  if (typeof msg.body !== "string" && !msg.hasMedia) return "no_body_no_media";
+  if (typeof msg.type === "string" && NON_ROUTABLE_TYPES.has(msg.type)) {
+    return `protocol_payload:${msg.type}`;
+  }
+  return "unknown";
 }
