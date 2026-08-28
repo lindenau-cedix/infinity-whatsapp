@@ -200,3 +200,106 @@ test('id-less image messages also reach the dispatcher after the relaxation', as
 
   try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
 });
+
+test('photo with downloadMedia() returning undefined does NOT crash route()', async () => {
+  // INFA-27 regression: whatsapp-web.js downloadMedia() resolves to
+  // `undefined` (not throws) in three real cases — late re-classification,
+  // mediaStage still FETCHING, store entry not hydrated. The pre-fix
+  // behavior was to feed that undefined into MediaStore.persist, which
+  // dereferenced `.data` and threw "Cannot read properties of undefined
+  // (reading 'data')". That crashed the whole route() chain and the
+  // operator saw only `wa.message.failed`. After the fix the photo is
+  // logged once as `media.unavailable` and the text branch still flows.
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  const sent = [];
+  adapter.sendReply = async (jid, reply) => { sent.push({ jid, text: reply.text }); };
+
+  const factory = () => ({
+    name: 'qwenCode',
+    run: async (text) => ({ text: `echo:${text}`, mediaRefs: [] }),
+  });
+
+  const dispatcher = new Dispatcher(adapter, factory, new Logger('test', 'info'));
+  dispatcher.bind();
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  adapter.attachMessageStream();
+
+  // Photo with a real id, real caption, real hasMedia:true — but
+  // downloadMedia() resolves to undefined (the wwebjs store entry
+  // hydration race). This is the exact shape the operator's log showed.
+  await new Promise((resolve) => {
+    assert.doesNotThrow(() => messageHandler({
+      id: { id: 'photo.001', _serialized: 'photo.001' },
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      body: 'hello',
+      hasMedia: true,
+      downloadMedia: () => Promise.resolve(undefined),
+      type: 'image',
+    }));
+    setTimeout(resolve, 200);
+  });
+
+  // Must produce exactly one reply — the text branch carries on.
+  assert.equal(sent.length, 1, 'unavailable-media photo must still produce a reply');
+  assert.equal(sent[0].jid, 'real-qwen@g.us');
+  assert.equal(sent[0].text, 'echo:hello');
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});
+
+test('photo with MessageMedia whose data is undefined does NOT crash route()', async () => {
+  // Same shape as above but the page-eval returned a populated MessageMedia
+  // whose `.data` is undefined. Pre-fix this still crashed at
+  // `Buffer.from(media.data, "base64")` in MediaStore.persist.
+  const groups = makeGroups();
+  const runtime = makeRuntime();
+  const adapter = new WWebJsAdapter(groups, runtime, stubMedia);
+
+  const sent = [];
+  adapter.sendReply = async (jid, reply) => { sent.push({ jid, text: reply.text }); };
+
+  const factory = () => ({
+    name: 'qwenCode',
+    run: async (text) => ({ text: `echo:${text}`, mediaRefs: [] }),
+  });
+
+  const dispatcher = new Dispatcher(adapter, factory, new Logger('test', 'info'));
+  dispatcher.bind();
+
+  let messageHandler = null;
+  adapter.client = {
+    on: (event, cb) => { if (event === 'message') messageHandler = cb; },
+    getChats: () => Promise.resolve([]),
+  };
+  adapter.attachMessageStream();
+
+  await new Promise((resolve) => {
+    assert.doesNotThrow(() => messageHandler({
+      id: { id: 'photo.002', _serialized: 'photo.002' },
+      from: 'real-qwen@g.us',
+      author: 'sender@c.us',
+      body: 'world',
+      hasMedia: true,
+      // Mimic whatsapp-web.js MessageMedia: the object exists but `.data`
+      // was never populated (e.g. a 404 during decrypt that returned a
+      // shell object instead of throwing).
+      downloadMedia: () => Promise.resolve({ data: undefined, mimetype: 'image/jpeg', filename: 'x.jpg' }),
+      type: 'image',
+    }));
+    setTimeout(resolve, 200);
+  });
+
+  assert.equal(sent.length, 1, 'data-undefined photo must still produce a reply');
+  assert.equal(sent[0].text, 'echo:world');
+
+  try { fs.rmSync(runtime.sessionPath, { recursive: true, force: true }); } catch {}
+});

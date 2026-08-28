@@ -366,7 +366,25 @@ export class WWebJsAdapter implements WhatsAppAdapter {
     }
 
     const { text, voiceReply, grillMe } = parseTriggers(msg.body ?? "");
-    const media = await this.collectAttachments(msg);
+    // Guard media collection so a single bad attachment does not abort
+    // the whole message — we still want the text branch (if any) to be
+    // delivered. The pre-2026-08-28 behavior was: collectAttachments
+    // throws on an unavailable media → route() rejects → message
+    // listener catch fires → operator sees `wa.message.failed` and
+    // nothing else. After the media.unavailable guard above this should
+    // be unreachable for the documented case, but the belt-and-braces
+    // catch here covers any future regression.
+    let media: IngressMessage["media"] = [];
+    try {
+      media = await this.collectAttachments(msg);
+    } catch (err) {
+      this.log.error("media.persist_failed", {
+        id: msg.id?._serialized ?? null,
+        from: typeof msg.from === "string" ? msg.from : null,
+        error: errorMsg(err),
+      });
+      media = [];
+    }
 
     const ingress: IngressMessage = {
       transportId: msg.id._serialized,
@@ -397,14 +415,38 @@ export class WWebJsAdapter implements WhatsAppAdapter {
   private async collectAttachments(msg: WWebJsMessage): Promise<IngressMessage["media"]> {
     if (!msg.hasMedia || !msg.downloadMedia) return [];
     const kind = classifyAttachment(this.previewMime(msg));
-    const media = await msg.downloadMedia();
+    // whatsapp-web.js downloadMedia() resolves to `undefined` (not throws)
+    // in three real-world cases:
+    //   (a) the message has no media after a late re-classification,
+    //   (b) the WA mediaStage is still FETCHING when the event fires,
+    //   (c) the page-eval returns undefined because the store entry was
+    //       not hydrated yet.
+    // Until 2026-08-28 we passed that undefined into MediaStore.persist,
+    // which then dereferenced `.data` and crashed the whole route() chain
+    // — surfacing as `wa.message.failed error="Cannot read properties of
+    // undefined (reading 'data')"`. Treat the unavailable case as zero
+    // attachments, log it so the operator can correlate, and let the text
+    // branch (if any) continue. INFA-27 media availability fix.
+    const messageMedia = await msg.downloadMedia();
+    if (!messageMedia || !messageMedia.data) {
+      this.log.info("media.unavailable", {
+        from: typeof msg.from === "string" ? msg.from : null,
+        id: msg.id?._serialized ?? null,
+        type: typeof msg.type === "string" ? msg.type : null,
+        kind,
+        reason: !messageMedia
+          ? "downloadMedia_returned_undefined"
+          : "messageMedia_data_undefined",
+      });
+      return [];
+    }
     // Synthesize the small interface MediaStore needs without re-importing
     // the MessageMedia shape — keeps the dependency boundary clean.
     const adapter = {
       getMedia: async () => ({
-        data: media.data,
-        mimetype: media.mimetype,
-        filename: media.filename ?? undefined,
+        data: messageMedia.data,
+        mimetype: messageMedia.mimetype,
+        filename: messageMedia.filename ?? undefined,
       }),
     };
     return [await this.media.persist(msg.id._serialized, 0, adapter, kind)];
