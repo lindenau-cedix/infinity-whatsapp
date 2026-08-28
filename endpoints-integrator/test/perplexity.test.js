@@ -324,7 +324,13 @@ test('perplexity: persistent bare "fetch failed" with no cause still surfaces re
   await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
     const original = global.fetch;
     let calls = 0;
-    global.fetch = async () => {
+    global.fetch = async (url) => {
+      // INFA-24 correction: the failure path now runs a reachability probe
+      // against the base URL before it dares claim "host unreachable".
+      // That probe is NOT a request attempt, so it must not be counted —
+      // count only real chat-completions calls. The probe throws here too,
+      // which is what makes the connectivity hint the correct verdict.
+      if (!String(url).includes('/chat/completions')) throw new TypeError('fetch failed');
       calls += 1;
       // Worst case: wrapper only, no cause, no code, no name. The wrapper
       // ITSELF is the diagnostic. We retry per the new classifier and on
@@ -382,7 +388,10 @@ test('perplexity: deep-research bails early on persistent opaque failures with c
   await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
     let calls = 0;
     const original = global.fetch;
-    global.fetch = async () => {
+    global.fetch = async (url) => {
+      // Reachability probe (INFA-24 correction) is not a request attempt.
+      // It fails too, so "unreachable host" stays the right verdict here.
+      if (!String(url).includes('/chat/completions')) throw new TypeError('fetch failed');
       calls += 1;
       // Persistent opaque failure — no cause, no code, no name.
       throw new TypeError('fetch failed');
@@ -401,20 +410,28 @@ test('perplexity: deep-research bails early on persistent opaque failures with c
   });
 });
 
-test('perplexity: deep-research bails early on persistent UND_ERR_SOCKET (visible transport-cluster)', async () => {
+test('perplexity: deep-research bails early on persistent UND_ERR_SOCKET when the host is genuinely unreachable', async () => {
   // INFA-24 widen: a visible transport-cluster error (UND_ERR_SOCKET) used
   // to burn the full retry budget because the operator "could already see
   // something" — the envelope just said `fetch failed (UND_ERR_SOCKET)`
   // with no hint. After the widen, two consecutive hits trip the same
   // early-bail + connectivity-hint envelope as a fully-opaque cluster,
   // because in both flavors the operator has no actionable response.
+  //
+  // INFA-24 correction: the hint is only correct when the endpoint really
+  // is unreachable, so here the probe fails too. See the companion test
+  // below for the case where the probe succeeds.
   await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
     let calls = 0;
     const original = global.fetch;
-    global.fetch = async () => {
+    global.fetch = async (url) => {
+      const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
+      // Probe also fails → host really is unreachable.
+      if (!String(url).includes('/chat/completions')) {
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
       calls += 1;
       // undici: wrapper says "fetch failed", inner cause has .name='UND_ERR_SOCKET'
-      const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
       throw Object.assign(new TypeError('fetch failed'), { cause });
     };
     const restore = () => { global.fetch = original; };
@@ -424,6 +441,44 @@ test('perplexity: deep-research bails early on persistent UND_ERR_SOCKET (visibl
         (err) => /early bail/i.test(String(err.message)) && /unreachable from this host/i.test(String(err.message)),
       );
       assert.equal(calls, 2, 'persistent visible transport-cluster should bail after 2 with the host-connectivity hint');
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('perplexity: UND_ERR_SOCKET does NOT claim "unreachable" when the endpoint answers a probe (INFA-24)', async () => {
+  // This is the regression that reopened INFA-24. The operator was told
+  // "Perplexity endpoint unreachable from this host — check your firewall,
+  // DNS, TLS proxy" while the host could reach the API perfectly well
+  // (verified live: curl 200, plain fetch 401). Sending someone to audit a
+  // firewall that was never broken is worse than saying nothing.
+  //
+  // When the probe succeeds, the envelope must say the endpoint is UP and
+  // point at the real cause (a slow / aborted request) instead.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    global.fetch = async (url) => {
+      // Probe succeeds: the endpoint is demonstrably reachable.
+      if (!String(url).includes('/chat/completions')) return { status: 401 };
+      const cause = Object.assign(new Error('socket hang up'), { name: 'UND_ERR_SOCKET' });
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    const restore = () => { global.fetch = original; };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => {
+          const m = String(err.message);
+          // MUST NOT blame the network...
+          assert.doesNotMatch(m, /unreachable from this host/i);
+          assert.doesNotMatch(m, /firewall/i);
+          // ...and MUST report what we actually observed.
+          assert.match(m, /endpoint is UP/i);
+          assert.match(m, /HTTP 401/);
+          return true;
+        },
+      );
     } finally {
       restore();
     }
@@ -454,6 +509,96 @@ test('perplexity: deep-research recovers on first UND_ERR_SOCKET (transient sock
       restore();
     }
   });
+});
+
+test('perplexity: UND_ERR_HEADERS_TIMEOUT is a timeout, not an unreachable host (INFA-24 root cause)', async () => {
+  // THE root cause of INFA-24. undici defaults headersTimeout to 300_000ms.
+  // sonar-deep-research streams nothing until the report is finished
+  // (measured live: 121s and 185s for trivial prompts, docs say up to 5min),
+  // so a real query lands right on that cliff, undici aborts the socket, and
+  // it surfaces as a bare `TypeError: fetch failed`.
+  //
+  // It must be retried, and it must NEVER be reported as an unreachable host.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    let calls = 0;
+    global.fetch = async (url) => {
+      if (!String(url).includes('/chat/completions')) return { status: 401 };
+      calls += 1;
+      if (calls === 1) {
+        const cause = Object.assign(new Error('Headers Timeout Error'), {
+          code: 'UND_ERR_HEADERS_TIMEOUT',
+          name: 'HeadersTimeoutError',
+        });
+        throw Object.assign(new TypeError('fetch failed'), { cause });
+      }
+      return okJson({ choices: [{ message: { content: 'deep research report' } }] });
+    };
+    try {
+      const text = await real.run('hi', { model: 'sonar-deep-research' });
+      assert.match(text, /deep research report/);
+      assert.equal(calls, 2, 'a headers timeout must be retried, not fatal');
+    } finally {
+      global.fetch = original;
+    }
+  });
+});
+
+test('perplexity: persistent headers timeout explains the deadline instead of blaming the network (INFA-24)', async () => {
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    global.fetch = async (url) => {
+      if (!String(url).includes('/chat/completions')) return { status: 401 };
+      const cause = Object.assign(new Error('Headers Timeout Error'), {
+        code: 'UND_ERR_HEADERS_TIMEOUT',
+        name: 'HeadersTimeoutError',
+      });
+      throw Object.assign(new TypeError('fetch failed'), { cause });
+    };
+    try {
+      await assert.rejects(
+        () => real.run('hi', { model: 'sonar-deep-research' }),
+        (err) => {
+          const m = String(err.message);
+          assert.doesNotMatch(m, /unreachable from this host/i);
+          assert.match(m, /exceeded the \d+ms per-attempt deadline/i);
+          return true;
+        },
+      );
+    } finally {
+      global.fetch = original;
+    }
+  });
+});
+
+test('perplexity: deep-research deadline clears undici\'s 300s headersTimeout cliff (INFA-24)', async () => {
+  // Guard the specific footgun: the old code set timeoutMs to exactly
+  // 300_000 — the same number undici uses for headersTimeout — so the two
+  // timers raced over every deep-research call and undici usually won.
+  // The deadline must sit strictly above that cliff.
+  await withEnv({ PERPLEXITY_API_KEY: 'pplx-test' }, async () => {
+    const original = global.fetch;
+    let seenTimeout;
+    global.fetch = async (url, init) => {
+      seenTimeout = init && init.signal;
+      return okJson({ choices: [{ message: { content: 'ok' } }] });
+    };
+    try {
+      await real.run('hi', { model: 'sonar-deep-research' });
+      assert.ok(seenTimeout, 'an AbortSignal must own the deadline');
+    } finally {
+      global.fetch = original;
+    }
+  });
+  // Assert the constant directly — this is the number that regressed.
+  const src = require('node:fs').readFileSync(require.resolve('../dispatcher/perplexity.js'), 'utf8');
+  const m = src.match(/isDeepResearch \? (\d[\d_]*) :/);
+  assert.ok(m, 'deep-research timeout constant should be greppable');
+  const deepTimeout = Number(m[1].replace(/_/g, ''));
+  assert.ok(
+    deepTimeout > 300_000,
+    `deep-research timeout (${deepTimeout}) must exceed undici's 300000ms headersTimeout default`,
+  );
 });
 
 test('perplexity: opaqueBailAfter option can disable early bail (INFA-24 deeper)', async () => {
